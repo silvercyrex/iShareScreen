@@ -68,6 +68,13 @@ helping a person in their own session, and IT working in a separate session.
   black screen on machines without a hardware H.264 decoder), and skips to
   the next full frame when the computer can't keep up instead of freezing.
 
+**Audio**
+- Includes upstream pull request #32 by Vincent Janelle (not yet merged
+  upstream): the Mac's audio is decoded with the bundled PyAV on Linux and
+  Windows. Ubuntu's `libfdk-aac2` package lacks the part Apple's audio needs,
+  so without this a Linux gateway had no audio. Browsers only start sound
+  after the viewer clicks the speaker button.
+
 **Other**
 - `requirements.lock`: the exact, hashed set of dependencies tested together.
 
