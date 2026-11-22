@@ -470,6 +470,19 @@ class FrameQualityGate:
             self._idr_observed_at[tile_idx] = 0.0
 
     # -- force-IDR manual fallback funnel -------------------------------
+    def mark_keyframe_forwarded(self, tile_idx: int) -> None:
+        """HPG fork: a keyframe for this tile went to a decoder elsewhere (the
+        browser, in pass-through, where iss itself decodes nothing). Without
+        this the request never clears, because recovery is otherwise judged
+        by iss's own decode, and the tile is re-requested every second for
+        the rest of the session."""
+        if not 0 <= tile_idx < self._num_tiles:
+            return
+        self._keyframe_required.discard(tile_idx)
+        self._idr_observed.discard(tile_idx)
+        self._fir_attempts[tile_idx] = 0
+        self._cap_warned[tile_idx] = False
+
     def force_keyframe_all(self) -> None:
         """Sets keyframe_required for every tile (single funnel for the
         TUI's force-IDR ('f') action + any other 'just refresh

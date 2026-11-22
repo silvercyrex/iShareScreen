@@ -211,6 +211,16 @@ class _CursorImage:
     rgba: bytes
 
 
+def _au_has_keyframe(nalus) -> bool:
+    """HPG fork: True if an access unit's slices include a keyframe."""
+    from .media.avc import _nal_is_keyframe
+    for nalu in nalus:
+        nb = bytes(nalu)
+        if nb and (nb[0] & 0x1F) in (1, 5):
+            return _nal_is_keyframe(nb)
+    return False
+
+
 def _leading_keyframes(tile_nalus: dict) -> dict:
     """HPG fork: per tile, the burst's NALUs up to and including its first
     keyframe (all of its intra slices), without the inter frames after it."""
@@ -2782,6 +2792,12 @@ class Session:
                     # _check_stall fire recovery instead of looking healthy.
                     self._last_publish_t = time.monotonic()
                     self._fresh_evt.set()
+                    # HPG fork: the browser decodes; a forwarded keyframe
+                    # answers the pending request (iss never decodes it).
+                    if not _PASSTHROUGH_LOCAL_DECODE and self._decoder is not None:
+                        gate = self._decoder._gate
+                        if ti in gate._keyframe_required and _au_has_keyframe(nalus):
+                            gate.mark_keyframe_forwarded(ti)
                 except Exception:
                     log.debug("video_au_callback raised", exc_info=True)
             if _PASSTHROUGH_LOCAL_DECODE:

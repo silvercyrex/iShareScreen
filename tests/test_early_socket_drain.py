@@ -87,3 +87,27 @@ def test_bridge_config_asks_for_passthrough():
     import inspect
     from isharescreen.frontend.wt.server import WebTransportBridge
     assert "video_passthrough=True" in inspect.getsource(WebTransportBridge.__init__)
+
+
+def test_forwarded_keyframe_stops_the_repeat_requests():
+    from isharescreen.proxy.media.quality_gate import FrameQualityGate
+    from isharescreen.proxy.session import _au_has_keyframe
+
+    class Clock:
+        t = 100.0
+
+        def monotonic(self):
+            return self.t
+    gate = FrameQualityGate(1)
+    gate._time = clock = Clock()
+    gate.force_keyframe_all()
+    asked = 0
+    for _ in range(5):                  # nothing decodes here: it keeps asking
+        clock.t += 1.1
+        asked += len(gate.consume_fir_request())
+    assert asked >= 3
+    assert _au_has_keyframe([_slice(1, 2)]) and not _au_has_keyframe([_slice(1, 0)])
+    gate.mark_keyframe_forwarded(0)
+    clock.t += 5.0
+    assert gate.consume_fir_request() == set()
+    gate.mark_keyframe_forwarded(7)     # out of range: ignored
