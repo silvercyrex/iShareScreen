@@ -91,6 +91,14 @@ _BROWSER_SPS_PATCH = os.environ.get("ISS_BROWSER_SPS_PATCH", "1") != "0"
 _BROWSER_NO_REORDER = os.environ.get("ISS_BROWSER_NO_REORDER", "1") != "0"
 
 
+def _int_or_dash(v) -> str:
+    """A page-supplied number for a log line, or '-' (never page text)."""
+    try:
+        return str(int(v))
+    except (TypeError, ValueError):
+        return "-"
+
+
 def _browser_sps(sps: bytes) -> bytes:
     """The SPS as sent to browsers."""
     if _BROWSER_SPS_PATCH:
@@ -1898,7 +1906,7 @@ class WebTransportBridge:
                     "browser[%s]: decode=%.1f fps streams=%.1f/s %.1f Mbit/s "
                     "queue=%d canvas=%dx%d pixel(mean=%.1f std=%.1f gray=%.0f%%) "
                     "audio[%s/ctx=%s pkts=%d frames=%d derr=%d serr=%d] "
-                    "total=%.1f MB",
+                    "total=%.1f MB raw_dy=%s",
                     verdict,
                     msg.get("decode_fps", 0), msg.get("stream_fps", 0),
                     msg.get("mbps", 0), msg.get("decoder_queue", 0),
@@ -1912,6 +1920,9 @@ class WebTransportBridge:
                     msg.get("audio_decode_err", 0),
                     msg.get("audio_submit_err", 0),
                     msg.get("total_mb", 0),
+                    # HPG fork: largest Y gap (Mac px) between Chrome's raw and
+                    # frame-aligned pointer positions in the last second.
+                    _int_or_dash(msg.get("raw_dy")),
                 )
             err = msg.get("decoder_error")
             if err:

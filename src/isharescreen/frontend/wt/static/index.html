@@ -1073,7 +1073,7 @@ async function main() {
   const dgrams = wt.datagrams;
   const dgWriter = (dgrams && dgrams.writable) ? dgrams.writable.getWriter() : null;
   if (!dgWriter) srvLog("info", "no datagram writer (Safari) — mouse moves go over the input stream");
-  let pendingMove = null, lastMoveSentT = 0;
+  let pendingMove = null;
   function sendPendingMove() {
     if (pendingMove !== null && readOnly) pendingMove = null;  // HPG fork
     if (pendingMove !== null) {
@@ -1091,7 +1091,6 @@ async function main() {
         send({type: "mouse", buttons: buttonMask, x: pendingMove[0], y: pendingMove[1]});
       }
       pendingMove = null;
-      lastMoveSentT = performance.now();
     }
   }
   function flushMove() {
@@ -1100,21 +1099,22 @@ async function main() {
   }
   requestAnimationFrame(flushMove);
 
+  // HPG fork: positions come from mousemove only. Sending pointerrawupdate
+  // positions as well made a dragged window jump up and down in the viewer
+  // embedded in the status page on Windows (the two events disagreed on Y
+  // by ~50 px). The raw event is only measured now: rawDy, the largest Y
+  // difference between it and the mousemove that follows, goes out with the
+  // stats as raw_dy.
+  let rawXY = null, rawDy = 0;
+  if ("onpointerrawupdate" in window) {
+    canvas.addEventListener("pointerrawupdate", (e) => { rawXY = inWindowToCanvas(e); });
+  }
   canvas.addEventListener("mousemove", (e) => {
     const xy = inWindowToCanvas(e);
-    if (xy) pendingMove = xy;
+    if (!xy) return;
+    if (rawXY) rawDy = Math.max(rawDy, Math.abs(rawXY[1] - xy[1]));
+    pendingMove = xy;
   });
-  // HPG fork: Chrome delivers mousemove aligned to the next frame (up to one
-  // frame late); pointerrawupdate arrives as soon as the mouse moves. Send
-  // those at once, at most every 4 ms. Other browsers keep the frame path.
-  if ("onpointerrawupdate" in window) {
-    canvas.addEventListener("pointerrawupdate", (e) => {
-      const xy = inWindowToCanvas(e);
-      if (!xy) return;
-      pendingMove = xy;
-      if (performance.now() - lastMoveSentT >= 4) sendPendingMove();
-    });
-  }
   // Apple's button mask is non-standard: bit 0 = left, bit 1 = right,
   // bit 2 = middle (right and middle are SWAPPED from the RFB spec).
   // DOM `e.button`: 0 = left, 1 = middle, 2 = right.
@@ -1294,6 +1294,7 @@ async function main() {
       total_mb: +(bytesReceived/1024/1024).toFixed(1),
       total_streams: frames,
       canvas_w: canvas.width, canvas_h: canvas.height,
+      raw_dy: rawDy,
       pixel_mean: lastSampleStats.mean,
       pixel_std: lastSampleStats.std,
       gray_frac: lastSampleStats.gray_frac,
@@ -1304,6 +1305,7 @@ async function main() {
       audio_decode_err: audioDecodeErrors,
       audio_submit_err: audioSubmitErrors,
     });
+    rawDy = 0;
   }, 1000);
 
   // Audio decode + playback via AudioWorklet ring buffer. The worklet
