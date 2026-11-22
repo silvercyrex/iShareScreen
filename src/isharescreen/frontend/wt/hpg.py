@@ -192,3 +192,18 @@ def clean_log_text(text: object, limit: int = 300) -> str:
     """Browser-supplied text going into our log: one line, bounded."""
     s = str(text)[:limit]
     return "".join(ch if ch.isprintable() else " " for ch in s)
+
+
+def read_udp_rcvbuf_errors(path: str = "/proc/net/snmp") -> "Optional[int]":
+    """Linux `Udp: RcvbufErrors`: datagrams the kernel dropped because a UDP
+    socket's receive buffer was full. Counted per network namespace, so in a
+    container it covers the container's sockets. None where unavailable."""
+    try:
+        with open(path) as f:
+            lines = [ln.split() for ln in f if ln.startswith("Udp:")]
+        if len(lines) < 2:
+            return None
+        header, values = lines[0], lines[1]
+        return int(values[header.index("RcvbufErrors")])
+    except (OSError, ValueError, IndexError):
+        return None

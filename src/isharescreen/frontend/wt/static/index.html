@@ -1085,11 +1085,20 @@ async function main() {
     // the person watching.
     const stuck = serverStats.stuck_s || 0;
     const loss = serverStats.loss_pct || 0;
-    const klass = stuck >= 1.5 ? "err" : "ok";
+    // HPG fork: no new frames from the Mac usually just means its screen is
+    // not changing (a login window), which is not a fault. Only a viewer that
+    // is waiting for a resync keyframe is shown as a problem.
+    const catchingUp = !!serverStats.resyncing;
+    const klass = catchingUp ? "err" : "ok";
     setStatus(
       `${dFps.toFixed(0)} fps · ${mbps.toFixed(2)} Mb/s · ${canvas.width}×${canvas.height}`
       + ` · loss ${loss.toFixed(2)}%`
-      + (stuck >= 1.5 ? ` · ⚠ frozen ${stuck.toFixed(1)}s` : "")
+      // HPG fork: frames the bridge skipped for THIS viewer to resync (path
+      // too slow / frame lost), and kernel buffer drops on the bridge.
+      + (serverStats.frames_dropped ? ` · skipped ${serverStats.frames_dropped}` : "")
+      + (serverStats.rcvbuf_errors ? ` · buffer drops ${serverStats.rcvbuf_errors}` : "")
+      + (catchingUp ? " · ⚠ catching up"
+         : stuck >= 1.5 ? ` · no change ${stuck.toFixed(0)}s` : "")
       + ` · ${serverStats.decoder || "?"}/${serverStats.encoder || "?"}`,
       klass,
     );

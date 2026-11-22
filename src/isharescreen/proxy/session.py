@@ -99,6 +99,9 @@ _TX_PROFILE_EVERY_N_TICKS = 4
 _UDP_RECV_TIMEOUT_S = 1.0
 _TCP_RECV_TIMEOUT_S = 1.0
 _PROFILE_RX = os.environ.get("ISS_WT_PROFILE", "0") == "1"
+# HPG fork: media socket receive buffer requested (the kernel caps it at
+# net.core.rmem_max; see _check_rmem_cap).
+_UDP_RCVBUF_BYTES = int(os.environ.get("ISS_UDP_RCVBUF", str(8 * 1024 * 1024)))
 # AVC → browser pass-through: skip iss's own (redundant) VideoToolbox decode of
 # forwarded AUs — the browser decodes them in WebCodecs. Halves decode CPU and
 # removes the decode latency the forward was gated behind. Default on; set
@@ -623,6 +626,8 @@ class Session:
         # that came FROM the host doesn't get sent BACK as a fresh
         # outbound msg 0x06 ClientCutText.
         self._last_received_clipboard_text: Optional[str] = None
+        # HPG fork: media socket SO_RCVBUF readback (0 = unknown/not Linux).
+        self.udp_rcvbuf = 0
 
         # Cursor pseudo-encoding (RFB enc 1104) state.
         # Server sends per-cursor pixmaps with a `cache_id` and may
@@ -1077,8 +1082,9 @@ class Session:
         # and the resulting bursts fit comfortably in the default
         # buffer. The trouble is specifically the no-curtain path
         # where the host downscales its full physical panel.
-        if not cfg.curtain:
-            self._check_rmem_cap(self._sock_video)
+        # HPG fork: check regardless of curtain; the browser path's H.264
+        # keyframes (~250 KB at 1080p) overflow a default buffer too.
+        self.udp_rcvbuf = self._check_rmem_cap(self._sock_video)
 
         # 2) Apple's two-TCP warmup (TCP #1: register session with daemon).
         if cfg.warmup_tcp:
@@ -4524,8 +4530,11 @@ class Session:
             # HPG fork (udp_connect): several processes share the port.
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         # Big rmem so the burst doesn't get dropped before we drain it.
+        # HPG fork: 8 MB by default (ISS_UDP_RCVBUF to change). One 1080p H.264
+        # keyframe from the Mac is ~250 KB sent as a burst; a host whose
+        # net.core.rmem_max is the 208 KB default overflows on every one.
         try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _UDP_RCVBUF_BYTES)
         except OSError:
             pass
         s.bind((host, port))
@@ -4534,7 +4543,7 @@ class Session:
         return s
 
     @staticmethod
-    def _check_rmem_cap(sock: socket.socket) -> None:
+    def _check_rmem_cap(sock: socket.socket) -> int:
         """Linux silently caps `SO_RCVBUF` at `net.core.rmem_max`. The
         default is ~208 KB on Ubuntu/Debian/Fedora — too small for
         Apple's HP burst — and the resulting kernel-level UDP drops
@@ -4546,17 +4555,20 @@ class Session:
         where the OS default is generous enough.
         """
         if sys.platform != "linux":
-            return
+            return 0
         # Kernel doubles the requested SO_RCVBUF for bookkeeping
-        # (socket(7)). We asked for 4 MiB, so a healthy readback is
-        # ~8 MiB. Anything under ~2 MiB readback means the cap clamped
+        # (socket(7)). Anything under ~2 MiB readback means the cap clamped
         # us hard.
         try:
             actual = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         except OSError:
-            return
+            return 0
+        # HPG fork: always say what we got, so an operator can check it.
+        log.info("UDP receive buffer: asked %d B, kernel gave %d B (SO_RCVBUF "
+                 "readback; the kernel doubles the request)",
+                 _UDP_RCVBUF_BYTES, actual)
         if actual >= 2 * 1024 * 1024:
-            return
+            return actual
         rmem_max = "<unknown>"
         try:
             with open("/proc/sys/net/core/rmem_max") as f:
@@ -4565,9 +4577,9 @@ class Session:
             pass
         log.warning(
             "Linux UDP receive buffer is small (SO_RCVBUF readback=%d B, "
-            "net.core.rmem_max=%s). With --no-curtain on, Apple's HEVC "
-            "burst will overflow this buffer and the kernel will silently "
-            "drop packets — expect gray-tile artifacts. To fix:\n"
+            "net.core.rmem_max=%s). Apple's keyframe bursts will overflow "
+            "this buffer and the kernel will silently drop packets — expect "
+            "gray or frozen pictures. To fix:\n"
             "  • drop --no-curtain (the default --curtain encodes a small "
             "virtual display whose bitrate fits the kernel default), or\n"
             "  • bump the kernel ceiling for this boot only:\n"
@@ -4578,6 +4590,7 @@ class Session:
             "        sudo sysctl --system",
             actual, rmem_max,
         )
+        return actual
 
     @staticmethod
     def _drain_socket_into(

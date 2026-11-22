@@ -61,7 +61,8 @@ from ...proxy.media.avc import _patch_avc_sps_dpb
 from .audio import OpusEncoder
 from .capsule import CapsuleType, H3Capsule, H3CapsuleDecoder
 from .cert import write_cert, trust_cert_in_keychain, is_cert_trusted
-from .hpg import AdmissionError, EventSink, TokenVerifier, clean_log_text
+from .hpg import (AdmissionError, EventSink, TokenVerifier, clean_log_text,
+                  read_udp_rcvbuf_errors)
 
 
 log = logging.getLogger(__name__)
@@ -165,7 +166,22 @@ _VIDEO_SINGLE_STREAM = os.environ.get("ISS_WT_VIDEO_SINGLE_STREAM", "0") == "1"
 # transport bounds latency for free via QUIC's stream-count limit; the single
 # stream needs this explicit.
 _SINGLE_STREAM_HIGH_WATER = int(
-    os.environ.get("ISS_WT_SINGLE_STREAM_HIGH_WATER", str(256 * 1024)))
+    os.environ.get("ISS_WT_SINGLE_STREAM_HIGH_WATER", str(8 * 1024 * 1024)))
+# HPG fork: "behind" is judged in TIME on the viewer's own path, not bytes:
+# queued video / (congestion window / smoothed RTT). A fixed 256 KB limit was
+# about one 1080p keyframe (248 KB measured), so on a slow path the resync
+# keyframe itself tripped the next drop. The byte limit above is now only a
+# hard safety cap.
+_MAX_BEHIND_S = float(os.environ.get("ISS_WT_MAX_BEHIND_MS", "500")) / 1000.0
+# While resyncing: ask for a keyframe only once the backlog has drained this
+# far (a new keyframe on top of a full queue just adds to it) ...
+_RESUME_BEHIND_S = float(os.environ.get("ISS_WT_RESUME_BEHIND_MS", "150")) / 1000.0
+# ... and ask again at this interval until one arrives. The Mac answers a FIR
+# about 1 s later and ignores one that comes too soon after its last keyframe
+# (measured, macOS 27.2.1), so a single request is not enough.
+_KEYFRAME_RETRY_S = float(os.environ.get("ISS_WT_KEYFRAME_RETRY_MS", "1500")) / 1000.0
+# HPG fork: QUIC congestion control towards the browser.
+_WT_CONGESTION = os.environ.get("ISS_WT_CONGESTION", "reno")
 # Profiling: log iss-side forward gaps (>80ms between AUs) to localize stutter.
 _PROFILE = os.environ.get("ISS_WT_PROFILE", "0") == "1"
 
@@ -191,6 +207,9 @@ class _ViewerSession:
         "capsule_decoder", "use_single_stream", "request_keyframe",
         # HPG fork: admission + per-viewer rights.
         "admission", "read_only", "joined_t", "close_cb",
+        # HPG fork: resync state (see _enter_resync / resync_tick).
+        "resync_since", "last_kf_request", "resyncs", "frames_sent",
+        "kf_end_offset",
     )
 
     def __init__(
@@ -251,6 +270,69 @@ class _ViewerSession:
         self.joined_t = 0.0
         # Set by the protocol: actively ends this viewer's WebTransport session.
         self.close_cb = None
+        # HPG fork: 0.0 while in sync; otherwise when this viewer started
+        # waiting for a resync keyframe (all deltas are dropped meanwhile).
+        self.resync_since = 0.0
+        self.last_kf_request = 0.0
+        self.resyncs = 0
+        self.frames_sent = 0
+        # Stream offset just past the newest keyframe written (single-stream).
+        self.kf_end_offset = 0
+
+    # -- HPG fork: drop-to-keyframe resync, shared by both transports -------
+
+    def behind_s(self) -> float:
+        """Seconds of video queued for this viewer on its own path: unsent and
+        unacked bytes of the video stream / (congestion window / RTT). 0 when
+        unknown (per-frame transport, or no RTT sample yet).
+
+        Bytes up to and including the newest keyframe don't count: that
+        keyframe has to arrive anyway, and on a slow or lossy path (QUIC
+        delivered ~2.5 Mbit/s on a 10 Mbit link with 1% loss) a 250 KB
+        keyframe alone takes about a second. Counting it made every keyframe
+        trip the next drop."""
+        if self.video_stream_id is None:
+            return 0.0
+        try:
+            quic = self.h3._quic
+            stream = quic._streams.get(self.video_stream_id)
+            if stream is None:
+                return 0.0
+            start = max(stream.sender._buffer_start, self.kf_end_offset)
+            backlog = stream.sender._buffer_stop - start
+            if backlog <= 0:
+                return 0.0
+            if stream.sender._buffer_stop - stream.sender._buffer_start \
+                    > _SINGLE_STREAM_HIGH_WATER:
+                return float("inf")
+            loss = quic._loss
+            rtt = max(getattr(loss, "_rtt_smoothed", 0.0) or 0.0, 0.005)
+            cwnd = max(loss.congestion_window, 1)
+            return backlog / (cwnd / rtt)
+        except Exception:
+            return 0.0
+
+    def _enter_resync(self, reason: str) -> None:
+        self.resync_since = time.monotonic()
+        self.resyncs += 1
+        if self.resyncs in (1, 2, 5, 10) or self.resyncs % 50 == 0:
+            log.info("viewer %d: %s — dropping frames until a keyframe "
+                     "(resync #%d)", self.session_id, reason, self.resyncs)
+
+    def resync_tick(self) -> None:
+        """While resyncing, ask for a keyframe once the backlog has drained,
+        and again every _KEYFRAME_RETRY_S until one gets through. Called on
+        every frame offered to this viewer AND from a periodic timer, so it
+        also runs on a still screen where no frames arrive."""
+        if not self.resync_since or self.request_keyframe is None:
+            return
+        now = time.monotonic()
+        if now - self.last_kf_request < _KEYFRAME_RETRY_S:
+            return
+        if self.behind_s() > _RESUME_BEHIND_S:
+            return
+        self.last_kf_request = now
+        self.request_keyframe(force=True)
 
     def send_control(self, obj: dict) -> None:
         """HPG fork: server→page JSON line on the viewer's input stream (auth
@@ -287,6 +369,15 @@ class _ViewerSession:
         if _VIDEO_SINGLE_STREAM or self.use_single_stream:
             self._send_frame_single(payload)
             return
+        t = payload[0] if payload else -1
+        if t in (_TYPE_VIDEO_DELTA, _TYPE_VIDEO_KEY) and self.resync_since:
+            # HPG fork: after a lost frame, only a keyframe can restart the
+            # picture; deltas would decode against a frame the viewer lacks
+            # (the smeared, blocky picture seen over the VPN).
+            if t == _TYPE_VIDEO_DELTA:
+                self.frames_dropped += 1
+                self.resync_tick()
+                return
         try:
             quic = self.h3._quic
             new_id = self.h3.create_webtransport_stream(
@@ -302,8 +393,19 @@ class _ViewerSession:
                 stream.receiver.is_finished = True
             quic.send_stream_data(stream_id=new_id, data=payload, end_stream=True)
             self.transmit()
+            if t in (_TYPE_VIDEO_DELTA, _TYPE_VIDEO_KEY):
+                self.frames_sent += 1
+                if t == _TYPE_VIDEO_KEY:
+                    self.resync_since = 0.0
         except Exception as e:
             log.debug("frame send failed (viewer %d): %s", self.session_id, e)
+            if t in (_TYPE_VIDEO_DELTA, _TYPE_VIDEO_KEY):
+                # HPG fork: upstream dropped the frame silently (e.g. out of
+                # stream credit on a long path) and kept sending deltas.
+                self.frames_dropped += 1
+                if not self.resync_since:
+                    self._enter_resync("frame could not be sent")
+                self.resync_tick()
 
     def _send_frame_single(self, payload: bytes) -> None:
         """Single-stream path: length-prefix each envelope onto ONE long-lived
@@ -340,35 +442,36 @@ class _ViewerSession:
                 if fresh is not None:
                     fresh.receiver.is_finished = True
 
-            # Deltas are droppable; keyframes/config/cursor are not.
-            if t == _TYPE_VIDEO_DELTA:
-                if self.video_discontinuity:
-                    return                      # waiting for the resync keyframe
-                stream = quic._streams.get(self.video_stream_id)
-                backlog = 0
-                if stream is not None:
-                    backlog = stream.sender._buffer_stop - stream.sender._buffer_start
-                if backlog > _SINGLE_STREAM_HIGH_WATER:
-                    # Stop feeding the stream (bounds the backlog) and resync
-                    # from a keyframe rather than resetting the stream.
-                    self.video_discontinuity = True
+            # HPG fork: deltas are dropped while this viewer is more than
+            # _MAX_BEHIND_S behind on its own path, then until a keyframe that
+            # can actually be delivered. Config/cursor always pass.
+            if t in (_TYPE_VIDEO_DELTA, _TYPE_VIDEO_KEY):
+                behind = self.behind_s()
+                if self.resync_since:
+                    if t == _TYPE_VIDEO_KEY and behind <= _MAX_BEHIND_S:
+                        self.resync_since = 0.0      # clean resync point
+                        self.video_discontinuity = False
+                    else:
+                        self.frames_dropped += 1
+                        self.resync_tick()
+                        return
+                elif t == _TYPE_VIDEO_DELTA and behind > _MAX_BEHIND_S:
                     self.frames_dropped += 1
-                    if self.request_keyframe is not None:
-                        self.request_keyframe()
-                    if self.frames_dropped in (1, 10, 100) or \
-                            self.frames_dropped % 500 == 0:
-                        log.info("single-stream: backlog %dKB over high-water "
-                                 "(viewer %d, drop #%d) — dropping deltas, "
-                                 "requesting keyframe", backlog // 1024,
-                                 self.session_id, self.frames_dropped)
+                    self.video_discontinuity = True
+                    self._enter_resync(
+                        f"{behind * 1000:.0f} ms of video queued")
+                    self.resync_tick()
                     return
-            elif t == _TYPE_VIDEO_KEY:
-                self.video_discontinuity = False   # clean resync point
+                self.frames_sent += 1
 
             framed = len(payload).to_bytes(4, "big") + payload
             quic.send_stream_data(
                 stream_id=self.video_stream_id, data=framed, end_stream=False,
             )
+            if t == _TYPE_VIDEO_KEY:
+                stream = quic._streams.get(self.video_stream_id)
+                if stream is not None:
+                    self.kf_end_offset = stream.sender._buffer_stop
             self.transmit()
         except Exception as e:
             log.debug("single-stream send failed (viewer %d): %s", self.session_id, e)
@@ -744,6 +847,9 @@ class WebTransportBridge:
             is_client=False,
             alpn_protocols=H3_ALPN,
             max_datagram_frame_size=65536,
+            # HPG fork: congestion control towards the browser (aioquic offers
+            # "reno" and "cubic"); see _WT_CONGESTION.
+            congestion_control_algorithm=_WT_CONGESTION,
         )
         config.load_cert_chain(str(cert_path), str(key_path))
         self._loop = asyncio.get_running_loop()
@@ -788,14 +894,37 @@ class WebTransportBridge:
 
         # HPG fork: server stats go to admitted viewers over their own
         # (authenticated) input stream, replacing the open GET /stats.
+        rcvbuf_base = read_udp_rcvbuf_errors()
+        rcvbuf_last = [rcvbuf_base]
+
         async def _stats_push():
             while True:
                 await asyncio.sleep(1.0)
                 stats = self._server_stats()
+                # HPG fork: kernel drops of Mac→bridge media because a socket
+                # receive buffer was full (invisible to RTP loss counting).
+                cur = read_udp_rcvbuf_errors()
+                if cur is not None and rcvbuf_base is not None:
+                    if rcvbuf_last[0] is not None and cur > rcvbuf_last[0]:
+                        log.warning("UDP receive buffer overflow: %d datagrams "
+                                    "dropped by the kernel in the last second "
+                                    "(raise net.core.rmem_max on the host)",
+                                    cur - rcvbuf_last[0])
+                    rcvbuf_last[0] = cur
+                    stats["rcvbuf_errors"] = cur - rcvbuf_base
                 with self._viewers_lock:
                     targets = list(self.viewers)
                 for v in targets:
-                    v.send_control({"type": "server_stats", **stats})
+                    # Keep resyncs moving on a still screen (no frames arrive
+                    # to drive them), and give each viewer its own counts.
+                    v.resync_tick()
+                    v.send_control({
+                        "type": "server_stats", **stats,
+                        "frames_dropped": v.frames_dropped,
+                        "resyncs": v.resyncs,
+                        "resyncing": bool(v.resync_since),
+                        "behind_ms": round(min(v.behind_s(), 60.0) * 1000),
+                    })
         asyncio.create_task(_stats_push())
 
         # Two listeners:
@@ -1111,14 +1240,17 @@ class WebTransportBridge:
             else:
                 self._linger_expired()
 
-    def request_keyframe(self) -> None:
+    def request_keyframe(self, force: bool = False) -> None:
         """Rate-limited FIR request, shared by recovery paths (decoder reset,
-        single-stream reset-on-backlog). macOS answers a FIR with an IDR in
-        ~75ms; suppress a redundant request while one is still in flight
-        (_kf_req_fir_t is cleared in _on_video_au when the IDR arrives)."""
+        single-stream reset-on-backlog). Suppress a redundant request while one
+        is still in flight (_kf_req_fir_t is cleared in _on_video_au when the
+        IDR arrives). HPG fork: `force` (a viewer's own resync retry, already
+        paced at _KEYFRAME_RETRY_S) bypasses the in-flight check: the Mac
+        answers about 1 s later and may ignore a request, so an old in-flight
+        marker must not block the retry."""
         now = time.monotonic()
         pending = getattr(self, "_kf_req_fir_t", 0.0)
-        if pending and (now - pending) <= 0.3:
+        if not force and pending and (now - pending) <= 0.3:
             return
         try:
             if self._session is not None:
@@ -1188,7 +1320,8 @@ class WebTransportBridge:
             self._session_attempts = 0
             self._mac_connected_t = time.monotonic()
             self._events.emit("mac_connected", host=self._config.host,
-                              user=self._config.username)
+                              user=self._config.username,
+                              udp_rcvbuf=getattr(session, "udp_rcvbuf", 0))
         except Exception as e:
             self._session_starting = False
             self._session_attempts += 1
@@ -1556,7 +1689,14 @@ class WebTransportBridge:
             # "recovering via FIR" spam on a healthy stream). Keyed STRICTLY on
             # "ok" — never on gray/frozen, which may be a silent d3d11va wedge
             # that genuinely needs the gate's FIR to recover.
-            if verdict == "ok" and self._session is not None:
+            # HPG fork: a STILL picture (NO_FRAMES: healthy canvas, 0 fps) and
+            # a browser that is merely behind (DECODE_LAG) are healthy too.
+            # Upstream only counted "ok", so on any static screen (a login
+            # window) the gate's false-positive "gray-out" FIRs ran unchecked:
+            # a ~250 KB keyframe about every second, which on a slow path
+            # filled the line by itself and the viewer could never catch up.
+            if verdict in ("ok", "NO_FRAMES", "DECODE_LAG") \
+                    and self._session is not None:
                 self._session.note_browser_healthy()
             # Throttle the routine "ok" heartbeat to once per 30s — a per-second
             # stats line is log spam. Anything NOT "ok" (a real problem) logs
