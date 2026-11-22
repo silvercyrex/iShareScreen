@@ -171,6 +171,12 @@ def _make_parser() -> argparse.ArgumentParser:
         help="exit once the Mac session ends (one session per process)",
     )
     g.add_argument(
+        "--shared-udp-ports", action="store_true",
+        help="Linux: let several iss processes on one address stream from "
+        "different Macs at once (the Mac always sends to UDP 5900/5901; each "
+        "process connects its sockets to its own Mac)",
+    )
+    g.add_argument(
         "--source-url", default=FORK_SOURCE_URL, metavar="URL",
         help="'Source code' link shown on the viewer page (AGPL section 13); "
         "point it at the exact commit that is running",
@@ -476,6 +482,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         audio=args.audio,
         share_console=args.share_console, alt_session=args.alt_session,
         share_without_asking=args.share_without_asking,
+        udp_connect=getattr(args, "shared_udp_ports", False),
         on_session_choice=_ask_session_choice if os.environ.get("ISS_SESSION_CHOICE_URL") else None,
         control_socket=args.control_socket,
         record_pcap=args.record,

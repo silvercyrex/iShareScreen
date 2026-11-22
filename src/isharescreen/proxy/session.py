@@ -288,6 +288,15 @@ class SessionConfig:
     # Custom values let a NAT relay route the streams.
     udp_ctrl_port: Optional[int] = None
     udp_video_port: Optional[int] = None
+    # HPG fork: connect() the two media sockets to the Mac. The Mac always
+    # streams to the viewer's UDP 5900/5901 whatever our source ports are
+    # (verified on macOS 27.2.1), so one address can only take one Mac's
+    # stream — unless each process's sockets are connected to their own Mac:
+    # Linux then delivers each Mac's packets to the matching socket, letting
+    # several iss processes on one gateway address stream from DIFFERENT Macs
+    # at the same time. Linux only (macOS refuses sendto() on a connected
+    # UDP socket).
+    udp_connect: bool = False
     udp_bind_host: str = ""  # "" = INADDR_ANY
 
     # Local control socket: when set, the Session opens a ControlServer at
@@ -1036,8 +1045,9 @@ class Session:
         # without a clash — the ports stay default (they're symmetric with the
         # server's), only the local interface narrows.
         bind_host = cfg.udp_bind_host or os.environ.get("ISS_UDP_BIND_HOST", "")
-        self._sock_ctrl = self._bind_udp(bind_host, ctrl_port)
-        self._sock_video = self._bind_udp(bind_host, video_port)
+        peer = (lambda p: (self._dest_host, p)) if cfg.udp_connect else (lambda p: None)
+        self._sock_ctrl = self._bind_udp(bind_host, ctrl_port, peer(self._ctrl_dest_port))
+        self._sock_video = self._bind_udp(bind_host, video_port, peer(self._video_dest_port))
         # Tap the media sockets so SRTP RTP/RTCP (and our heartbeats /
         # firewall punches) land in the capture alongside the TCP control
         # stream. The tap is a transparent proxy — every other socket call
@@ -2287,6 +2297,8 @@ class Session:
                 pkt, _addr = sock.recvfrom(65536)
             except socket.timeout:
                 continue
+            except ConnectionRefusedError:
+                continue   # HPG fork: connected socket, ICMP from a punch
             except OSError:
                 return
             self._rx_pkts_video += 1
@@ -2989,6 +3001,8 @@ class Session:
                 pkt, _addr = sock.recvfrom(65536)
             except socket.timeout:
                 continue
+            except ConnectionRefusedError:
+                continue   # HPG fork: connected socket, ICMP from a punch
             except OSError:
                 return
             self._rx_pkts_ctrl += 1
@@ -4503,15 +4517,20 @@ class Session:
             stop.wait(0.1)
 
     @staticmethod
-    def _bind_udp(host: str, port: int) -> socket.socket:
+    def _bind_udp(host: str, port: int, peer=None) -> socket.socket:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if peer is not None and hasattr(socket, "SO_REUSEPORT"):
+            # HPG fork (udp_connect): several processes share the port.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         # Big rmem so the burst doesn't get dropped before we drain it.
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         except OSError:
             pass
         s.bind((host, port))
+        if peer is not None:
+            s.connect(peer)
         return s
 
     @staticmethod
@@ -4571,6 +4590,8 @@ class Session:
         while time.monotonic() < deadline:
             try:
                 pkt, _ = sock.recvfrom(65536)
+            except ConnectionRefusedError:
+                continue   # HPG fork: connected socket, ICMP from a punch
             except socket.timeout:
                 # Burst typically lands within 200-400 ms; once we see
                 # no packets for 50 ms after some have arrived, we have

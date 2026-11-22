@@ -45,6 +45,11 @@ helping a person in their own session, and IT working in a separate session.
 - Curtain (blanking the Mac's screen) and clipboard sync are off by default.
 - The TLS key is written readable by its owner only.
 - Fixed a deadlock when a viewer joined a session that was already running.
+- `--shared-udp-ports` (Linux): several bridges on one gateway address can
+  stream from different Macs at once. The Mac always sends to the viewer's
+  UDP 5900/5901; each process now connects its sockets to its own Mac so
+  Linux hands each Mac's packets to the right process. Without it, a second
+  session starting on the gateway took the first one's packets.
 
 **Separate session (`--alt-session`)**
 - Reconnecting to a user's existing session works. Upstream sent the
@@ -73,8 +78,10 @@ date. `src/isharescreen/frontend/wt/hpg.py` is new.
 
 - The SRP server proof (M2) is still not checked; none of HPG's test Macs
   offer SRP, so a check could not be tested.
-- One bridge process per Mac session per address: the client always uses
-  local UDP ports 5900/5901.
+- Two sessions to the SAME Mac from one gateway address at the same time
+  are not possible (the Mac always streams to UDP 5900/5901). Different Macs
+  at the same time work with `--shared-udp-ports`; tested with one real Mac
+  plus a second process holding the ports (only one test Mac exists).
 - The viewer's status bar shows "frozen" whenever the Mac's screen is still
   (upstream behaviour): a still screen is not a fault.
 
@@ -85,7 +92,7 @@ printf '%s\n' "$MAC_PASSWORD" | iss --host 100.64.0.4 -u admin --password-stdin 
     --auth nonsrp --share-without-asking --no-audio \
     --bind 100.64.0.6 --bridge-port 4433 --no-page \
     --ticket-key-file /etc/hpg-gateway/iss-bridge.key \
-    --events --connection-name TJG7HR9K4C --exit-after-session \
+    --events --connection-name TJG7HR9K4C --exit-after-session --shared-udp-ports \
     --source-url https://github.com/silvercyrex/iShareScreen/tree/<commit>
 ```
 
