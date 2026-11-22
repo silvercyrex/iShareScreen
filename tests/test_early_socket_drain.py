@@ -128,3 +128,26 @@ def test_sps_no_reorder_signal_only_for_high_profile():
     hi422 = bytes([0x67, 122, 0x00, 52, 0xAC])
     assert _sps_signal_no_reorder(hi422) == hi422        # set3 = "intra" there
     assert _sps_signal_no_reorder(b"\x68\x64\x00\x34") == b"\x68\x64\x00\x34"  # not an SPS
+
+
+def test_remove_emulation_prevention_matches_the_byte_loop():
+    import random
+    from isharescreen.proxy.media.bitstream import remove_emulation_prevention
+
+    def slow(data):
+        out, i, n = bytearray(), 0, len(data)
+        while i < n:
+            if i + 2 < n and data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 3:
+                out += b"\x00\x00"
+                i += 3
+            else:
+                out.append(data[i])
+                i += 1
+        return bytes(out)
+    rnd = random.Random(7)
+    cases = [b"", b"\x00\x00\x03", b"\x00\x00\x00\x03", b"\x00\x00\x03\x00\x00\x03",
+             b"\x00\x00", b"\x00\x03\x00\x00\x03\x01"]
+    cases += [bytes(rnd.choice((0, 0, 3, 1, 255)) for _ in range(rnd.randrange(60)))
+              for _ in range(3000)]
+    for c in cases:
+        assert remove_emulation_prevention(c) == slow(c), c

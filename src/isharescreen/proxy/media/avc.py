@@ -192,7 +192,7 @@ def _nal_is_keyframe(nalu: bytes) -> bool:
     if t == 1:               # NAL_SLICE_NONIDR — intra if slice_type is I
         from .bitstream import BitReader, remove_emulation_prevention
         try:
-            br = BitReader(remove_emulation_prevention(nalu[1:]))
+            br = BitReader(remove_emulation_prevention(nalu[1:33]))  # HPG fork: header only
             br.read_ue()                  # first_mb_in_slice
             return br.read_ue() in (2, 7)  # slice_type
         except Exception:

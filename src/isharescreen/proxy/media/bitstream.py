@@ -11,16 +11,19 @@ from __future__ import annotations
 
 def remove_emulation_prevention(data: bytes) -> bytes:
     """Strip the `00 00 03` → `00 00` emulation-prevention transform from RBSP."""
+    # HPG fork: scan with bytes.find instead of a Python loop per byte (same
+    # output; ~100x faster on a frame-sized buffer).
+    data = bytes(data)
+    i = data.find(b"\x00\x00\x03")
+    if i < 0:
+        return data
     out = bytearray()
-    i, n = 0, len(data)
-    while i < n:
-        if i + 2 < n and data[i] == 0 and data[i + 1] == 0 and data[i + 2] == 3:
-            out.append(0)
-            out.append(0)
-            i += 3
-        else:
-            out.append(data[i])
-            i += 1
+    start = 0
+    while i >= 0:
+        out += data[start:i + 2]
+        start = i + 3
+        i = data.find(b"\x00\x00\x03", start)
+    out += data[start:]
     return bytes(out)
 
 

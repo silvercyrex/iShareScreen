@@ -128,7 +128,9 @@ def au_is_keyframe(au_annexb: bytes) -> bool:
             return True
         if t == NAL_SLICE_NONIDR:
             try:
-                br = BitReader(remove_emulation_prevention(nal[1:]))
+                # HPG fork: the two ue(v) fields fit in a few bytes; don't
+                # unescape the whole slice (that was most of the bridge's CPU).
+                br = BitReader(remove_emulation_prevention(nal[1:33]))
                 br.read_ue()                 # first_mb_in_slice
                 slice_type = br.read_ue()    # slice_type
                 if slice_type in (2, 7):
