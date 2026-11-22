@@ -45,6 +45,10 @@ from .proxy.session import Session, SessionConfig
 
 log = logging.getLogger("iss.cli")
 
+# HPG fork: public source of this fork (AGPL section 13 "Source code" link).
+# A launcher should pass --source-url with the exact running commit.
+FORK_SOURCE_URL = "https://github.com/silvercyrex/iShareScreen"
+
 
 # ── argparse construction ────────────────────────────────────────────
 
@@ -102,7 +106,8 @@ def _make_parser() -> argparse.ArgumentParser:
     g.add_argument("--port", type=int, default=5900, help="TCP port (default 5900)")
     g.add_argument(
         "--auth", choices=("srp", "nonsrp"), default="srp",
-        help="authentication mode (default srp; falls back to nonsrp on rejection)",
+        help="authentication mode (default srp). srp never falls back; the "
+        "older nonsrp login runs only when chosen here",
     )
     g.add_argument(
         "--frontend", choices=("browser", "desktop"), default="browser",
@@ -119,6 +124,54 @@ def _make_parser() -> argparse.ArgumentParser:
         "keychain (one-time auth prompt) so Safari works. Safari can't use "
         "the self-signed cert otherwise — WebKit lacks serverCertificateHashes. "
         "Chrome/Edge/Firefox don't need this.",
+    )
+
+    # HPG fork: options for running the browser bridge under a launcher.
+    g = p.add_argument_group("browser bridge (HPG fork)")
+    g.add_argument(
+        "--bind", default="127.0.0.1", metavar="ADDR",
+        help="address the bridge listens on (default 127.0.0.1)",
+    )
+    g.add_argument(
+        "--ticket-key-file", metavar="PATH", default=None,
+        help="require HPG tickets signed with this key (file holds the key as "
+        "64 hex characters or raw bytes). Without it the bridge prints a "
+        "one-time local token instead",
+    )
+    g.add_argument(
+        "--events", action="store_true",
+        help="write JSON event lines on stdout for a launcher (ready, "
+        "mac_connected, viewer_joined, viewer_left, session_log, ended)",
+    )
+    g.add_argument(
+        "--connection-name", default="", metavar="NAME",
+        help="name used in session log lines (default: the --host value)",
+    )
+    g.add_argument(
+        "--no-page", dest="serve_page", action="store_false",
+        help="don't serve the viewer page; the launcher's HTTPS site serves it",
+    )
+    g.add_argument(
+        "--view-only", action="store_true",
+        help="every viewer is view-only (no mouse, keyboard or resize)",
+    )
+    g.add_argument(
+        "--linger", type=float, default=15.0, metavar="SECS",
+        help="keep the Mac session this long after the last viewer leaves, so "
+        "a page reload doesn't log in again (default 15)",
+    )
+    g.add_argument(
+        "--idle-timeout", type=float, default=0.0, metavar="SECS",
+        help="end the session after this long without viewer input (0 = off)",
+    )
+    g.add_argument(
+        "--exit-after-session", action="store_true",
+        help="exit once the Mac session ends (one session per process)",
+    )
+    g.add_argument(
+        "--source-url", default=FORK_SOURCE_URL, metavar="URL",
+        help="'Source code' link shown on the viewer page (AGPL section 13); "
+        "point it at the exact commit that is running",
     )
 
     g = p.add_argument_group("display")
@@ -194,10 +247,11 @@ def _make_parser() -> argparse.ArgumentParser:
               "this machine) and exit"),
     )
     g.add_argument(
-        "--curtain", action=argparse.BooleanOptionalAction, default=True,
+        "--curtain", action=argparse.BooleanOptionalAction, default=False,
         help=(
             "blank the host's physical screen via a SkyLight virtual "
-            "display while we view (default on; --no-curtain to mirror "
+            "display while we view (HPG fork: default off; --curtain to blank, "
+            "--no-curtain to mirror "
             "the physical display instead)"
         ),
     )
@@ -519,10 +573,43 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
     # cleanly with one decoder, no compositing.
     os.environ.setdefault("ISS_TILES_PER_FRAME", "1")
     from isharescreen.frontend.wt.server import run as run_browser
+    from isharescreen.frontend.wt.hpg import EventSink, TicketVerifier, TokenVerifier
+    if args.ticket_key_file:
+        admission = TicketVerifier(_read_ticket_key(args.ticket_key_file),
+                                   host=config.host, port=config.port)
+    else:
+        admission = TokenVerifier(read_only=args.view_only)
     return run_browser(
         config, port=args.bridge_port,
         trust_cert_for_safari=getattr(args, "trust_cert_for_safari", False),
+        bind=args.bind,
+        admission=admission,
+        events=EventSink(args.events, args.connection_name or config.host),
+        serve_page=args.serve_page,
+        view_only=args.view_only,
+        linger_s=args.linger,
+        idle_timeout_s=args.idle_timeout,
+        exit_after_session=args.exit_after_session,
+        source_url=args.source_url,
     )
+
+
+def _read_ticket_key(path: str) -> bytes:
+    """HPG fork: the bridge's derived ticket key, as 64 hex chars or raw bytes.
+    Refuses a key file other users can read."""
+    st = os.stat(path)
+    if os.name == "posix" and st.st_mode & 0o077:
+        raise SystemExit(f"{path}: key file must not be readable by others (chmod 600)")
+    raw = open(path, "rb").read()
+    text = raw.strip()
+    try:
+        if len(text) == 64:
+            return bytes.fromhex(text.decode())
+    except ValueError:
+        pass
+    if len(raw) < 32:
+        raise SystemExit(f"{path}: ticket key too short")
+    return raw
 
 
 # ── entry point ──────────────────────────────────────────────────────

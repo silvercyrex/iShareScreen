@@ -263,11 +263,12 @@ class SessionConfig:
     # negotiation so the daemon spins up a SkyLight virtual display
     # and blanks the host's physical screen while we view. When False,
     # we skip that message entirely — the daemon then encodes whatever
-    # is on the physical display, no curtain. Default on for privacy
-    # (the host's screen isn't broadcast to anyone walking past). The
+    # is on the physical display, no curtain. HPG fork: default OFF — when
+    # IT helps someone, that person must be able to see what is happening on
+    # their own screen (upstream default was on). The
     # cmd=2 alt-session path ignores this flag and always sends Apple's
     # canned SDC instead.
-    curtain: bool = True
+    curtain: bool = False
 
     # Which 4-SSRC quality tier to subscribe to (0 = highest, ascending = lower).
     quality_tier: int = 0
@@ -1269,9 +1270,10 @@ class Session:
 
         # 9b) Inbound clipboard sync (host → local OS). Enable the daemon's
         # change-notification subscription (msg 0x15) and prime the local
-        # clipboard with the current host contents (msg 0x0b). Opt out by
-        # setting ISS_CLIP=0.
-        if os.environ.get("ISS_CLIP", "1") != "0":
+        # clipboard with the current host contents (msg 0x0b). HPG fork: off
+        # unless ISS_CLIP=1 (upstream default was on; it syncs the Mac with the
+        # machine running iss — on a gateway, that is the gateway).
+        if os.environ.get("ISS_CLIP", "0") == "1":
             try:
                 self._input.send_clipboard_enable()
                 self._input.send_clipboard_fetch()
@@ -1519,12 +1521,12 @@ class Session:
         (Session._last_received_clipboard_text), preventing a feedback
         loop with the inbound 0x1f path.
 
-        Off-switch: ISS_CLIP=0 disables the entire clipboard subsystem
+        HPG fork: off unless ISS_CLIP=1. ISS_CLIP=0 disables the entire clipboard subsystem
         (also prevents the inbound prime fetch above). Also a no-op when
         the platform clipboard isn't reachable (e.g. Linux without
         xclip/wl-clipboard installed) — `local_clipboard.available()`
         already logged an actionable hint at session startup."""
-        if os.environ.get("ISS_CLIP", "1") == "0":
+        if os.environ.get("ISS_CLIP", "0") != "1":
             return
         if self._input is None:
             return

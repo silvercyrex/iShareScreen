@@ -97,6 +97,13 @@
     font: inherit; font-weight: 600; white-space: nowrap;
   }
   #openall:hover { background: rgba(40,140,240,1); }
+  /* HPG fork: view-only badge and the AGPL "Source code" link. */
+  #ro-badge {
+    flex: 0 0 auto; padding: 2px 8px; border-radius: 4px;
+    background: rgba(220,160,20,.25); color: #ffd98a; white-space: nowrap;
+  }
+  #src-link { flex: 0 0 auto; color: #9cc8ff; text-decoration: none; white-space: nowrap; }
+  #src-link:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -136,6 +143,9 @@
   </select>
   <button id="unmute" title="Toggle audio">🔇</button>
   <button id="fs-btn" title="Fullscreen (auto-hides this bar)">⛶</button>
+  <span id="ro-badge" title="You can watch but not control this screen" style="display:none">View only</span>
+  <a id="src-link" target="_blank" rel="noopener noreferrer"
+     title="This viewer is free software (AGPL-3.0): get its source code">Source code</a>
 </div>
 <script>
 "use strict";
@@ -214,14 +224,19 @@ function setStatus(msg, klass) {
 
 // Relay browser-side log messages back to the iss server so they
 // appear in the iss log alongside server-side events. Best-effort.
+// HPG fork: sent over the viewer's authenticated WebTransport input stream
+// (upstream used an open POST /log); queued until that stream exists, and
+// rate-limited.
+const __logQueue = [];
+let __logSink = null, __logBudget = 30;
+setInterval(() => { __logBudget = 30; }, 60000);
 function srvLog(level, msg) {
   console[level === "error" ? "error" : "log"]("[srvlog]", msg);
-  fetch("/log", {
-    method: "POST",
-    headers: {"content-type": "application/json"},
-    body: JSON.stringify({level, msg}),
-    keepalive: true,
-  }).catch(() => {});
+  if (__logBudget <= 0) return;
+  __logBudget--;
+  const rec = {type: "log", level, msg: String(msg).slice(0, 300)};
+  if (__logSink) __logSink(rec);
+  else if (__logQueue.length < 50) __logQueue.push(rec);
 }
 
 window.addEventListener("error", (e) => {
@@ -352,22 +367,66 @@ function fitCanvasToStage(intrinsicW, intrinsicH) {
   canvas.style.height = h + "px";
 }
 
+// HPG fork: where the bridge is and how to get in.
+//  - Embedded (?embed=1&parent=<origin>): the launcher's HTTPS page sends
+//    {type:"iss-config", wt_url, cert_sha256, ticket, source_url, dynamic}
+//    by postMessage; only messages from window.parent with exactly that
+//    origin count. The ticket never appears in a URL.
+//  - Local: the bridge served this page; the one-time token is in the URL
+//    fragment (#token=…), which the browser never sends to a server.
+async function getBoot(params) {
+  if (params.get("embed") === "1") {
+    const parentOrigin = params.get("parent");
+    if (!parentOrigin) throw new Error("embedded viewer needs ?parent=<origin>");
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no settings from the parent page")), 15000);
+      window.addEventListener("message", function onMsg(ev) {
+        if (ev.source !== window.parent || ev.origin !== parentOrigin) return;
+        const d = ev.data || {};
+        if (d.type !== "iss-config") return;
+        window.removeEventListener("message", onMsg);
+        clearTimeout(timer);
+        resolve({
+          wtUrl: String(d.wt_url || ""), certHash: String(d.cert_sha256 || ""),
+          auth: {type: "auth", ticket: String(d.ticket || "")},
+          sourceUrl: String(d.source_url || ""), dynamic: !!d.dynamic, local: false,
+        });
+      });
+      window.parent.postMessage({type: "iss-ready"}, parentOrigin);
+    });
+  }
+  const frag = new URLSearchParams(location.hash.slice(1));
+  const token = frag.get("token") || "";
+  if (token) history.replaceState(null, "", location.pathname + location.search);
+  let certHash = params.get("hash");
+  if (!certHash) certHash = (await (await fetch("/cert-hash")).text()).trim();
+  return {wtUrl: `https://${location.host}/wt`, certHash,
+          auth: {type: "auth", token}, sourceUrl: "", dynamic: null, local: true};
+}
+
 async function main() {
   // The HTML page is served over plain HTTP; the cert hash for the
   // (HTTPS-but-self-signed) WebTransport endpoint is fetched from
   // /cert-hash on the same origin. ?hash=… is a fallback for
   // bookmarks / direct navigation.
   const params = new URLSearchParams(location.search);
-  let certHash = params.get("hash");
-  if (!certHash) {
-    try {
-      const r = await fetch("/cert-hash");
-      certHash = (await r.text()).trim();
-    } catch (e) {
-      setStatus("missing cert hash", "err");
-      return;
-    }
+  let boot;
+  try {
+    boot = await getBoot(params);
+  } catch (e) {
+    setStatus(`cannot start: ${e.message || e}`, "err");
+    return;
   }
+  const certHash = boot.certHash;
+  if (!certHash || !boot.wtUrl) {
+    setStatus("missing bridge address or certificate hash", "err");
+    return;
+  }
+  const srcLink = document.getElementById("src-link");
+  function setSourceUrl(u) {
+    if (/^https:\/\//.test(u || "")) srcLink.href = u;
+  }
+  setSourceUrl(boot.sourceUrl);
   if (!("WebTransport" in window)) {
     // Chrome only exposes WebTransport on a Secure Context: HTTPS, or
     // http://localhost. Plain-HTTP IP/LAN origins make the constructor
@@ -400,12 +459,17 @@ async function main() {
   let safariTrusted = false;
   let singleStream = false;
   let dynamicRes = false;
-  try {
-    const cfg = await (await fetch("/wt-config")).json();
-    safariTrusted = !!cfg.safariTrusted;
-    singleStream = !!cfg.videoSingleStream;
-    dynamicRes = !!cfg.dynamic;
-  } catch (e) { /* older server without /wt-config — assume not trusted */ }
+  if (boot.local) {
+    try {
+      const cfg = await (await fetch("/wt-config")).json();
+      safariTrusted = !!cfg.safariTrusted;
+      singleStream = !!cfg.videoSingleStream;
+      dynamicRes = !!cfg.dynamic;
+      setSourceUrl(cfg.sourceUrl);
+    } catch (e) { /* older server without /wt-config — assume not trusted */ }
+  } else {
+    dynamicRes = !!boot.dynamic;
+  }
   // In per-monitor crop mode we must keep the full combined canvas (all host
   // displays) so their rects stay valid; a dynamic re-encode to the window
   // would collapse it to one window-sized view. Force non-dynamic.
@@ -439,8 +503,7 @@ async function main() {
   // cert via serverCertificateHashes. Safari (with --trust-cert-for-safari)
   // ignores hashes and validates against the keychain-trusted cert, so we
   // omit the option entirely for it.
-  const wtUrl = `https://${location.host}/wt` +
-    (singleStream ? "?transport=single" : "");
+  const wtUrl = boot.wtUrl + (singleStream ? "?transport=single" : "");
   setStatus("opening WebTransport…");
   const useHashes = !(isSafari && safariTrusted);
   srvLog("info", `WT connect: ${wtUrl} ${useHashes ? "hash=" + certHash : "(keychain trust)"}`);
@@ -594,10 +657,14 @@ async function main() {
         }, wait);
       },
     });
-    // Hardware decode by default (low CPU; the platform HW decoder handles this
-    // stream fine now that frames aren't corrupted). ?decode=sw forces software.
+    // HPG fork: "no-preference" by default — the browser uses its hardware
+    // decoder when it has one and software otherwise. Upstream asked for
+    // "prefer-hardware", which Chrome REJECTS outright (no fallback) on a
+    // machine without hardware H.264 decode: the viewer stayed black.
+    // ?decode=sw / ?decode=hw still force one or the other.
     const qp = new URLSearchParams(location.search);
-    const hwPref = qp.get("decode") === "sw" ? "prefer-software" : "prefer-hardware";
+    const hwPref = qp.get("decode") === "sw" ? "prefer-software"
+                 : qp.get("decode") === "hw" ? "prefer-hardware" : "no-preference";
     dec.configure({
       codec: (geom && geom.codec) || "avc1.640032",
       optimizeForLatency: qp.get("lat") !== "0",   // default true; ?lat=0 disables
@@ -642,8 +709,25 @@ async function main() {
     }
   }
 
+  // HPG fork: when this machine can't decode as fast as frames arrive, the
+  // decoder queue grows without bound until it errors and the picture freezes
+  // (seen at ~20 fps in software). Past this backlog, drop to the next
+  // keyframe and ask for one, so the picture skips ahead instead.
+  const DECODE_BACKLOG_MAX = 20;
+  let lastBacklogKfT = 0;
   function feedAU(au) {
     if (au.isKey) awaitingKey = false;
+    if (!au.isKey && decoder && decoder.decodeQueueSize > DECODE_BACKLOG_MAX) {
+      awaitingKey = true;
+      dropped++;
+      const now = performance.now();
+      if (now - lastBacklogKfT > 1000) {
+        lastBacklogKfT = now;
+        srvLog("info", `decoder behind (queue ${decoder.decodeQueueSize}); skipping to next keyframe`);
+        try { send({ type: "keyframe" }); } catch (e) {}
+      }
+      return;
+    }
     if (awaitingKey) return;
     frames++;
     if (PROF) {
@@ -745,6 +829,39 @@ async function main() {
   const inputWriter = inputStream.writable.getWriter();
   const enc = new TextEncoder();
   let buttonMask = 0;
+  // HPG fork: the credential is the first line; nothing else counts before it.
+  let readOnly = true;   // until the bridge says otherwise
+  await inputWriter.write(enc.encode(JSON.stringify(boot.auth) + "\n"));
+  boot.auth = null;
+  __logSink = (rec) => send(rec);
+  while (__logQueue.length) send(__logQueue.shift());
+  let serverStats = {loss_pct: 0, stuck_s: 0, decoder: "", encoder: ""};
+  // Server → page lines on the same (authenticated) stream.
+  (async () => {
+    const rd = inputStream.readable.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const {value, done} = await rd.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        let m; try { m = JSON.parse(line); } catch (e) { continue; }
+        if (m.type === "server_stats") serverStats = m;
+        else if (m.type === "auth_ok") {
+          readOnly = !!m.read_only;
+          document.getElementById("ro-badge").style.display = readOnly ? "" : "none";
+          setSourceUrl(m.source_url);
+        } else if (m.type === "auth_failed") {
+          setStatus(`not allowed: ${m.reason || "refused"}`, "err");
+        } else if (m.type === "ended") {
+          setStatus(`session ended: ${m.reason || ""}`, "err");
+        }
+      }
+    }
+  })().catch(() => {});
 
   function inWindowToCanvas(ev) {
     if (intrinsic.w === 0) return null;
@@ -756,6 +873,7 @@ async function main() {
   }
 
   async function send(obj) {
+    if (readOnly && obj.type !== "stats" && obj.type !== "keyframe" && obj.type !== "log") return;
     try { await inputWriter.write(enc.encode(JSON.stringify(obj) + "\n")); }
     catch (e) { /* writer closed during teardown */ }
   }
@@ -830,6 +948,7 @@ async function main() {
   if (!dgWriter) srvLog("info", "no datagram writer (Safari) — mouse moves go over the input stream");
   let pendingMove = null;
   function flushMove() {
+    if (pendingMove !== null && readOnly) pendingMove = null;  // HPG fork
     if (pendingMove !== null) {
       if (dgWriter) {
         // 13-byte fixed-format mouse-move datagram.
@@ -941,16 +1060,8 @@ async function main() {
   const reader = wt.incomingUnidirectionalStreams.getReader();
   let frames = 0, bytesReceived = 0;
   let lastDecoded = 0, lastFrames = 0, lastBytes = 0, lastT = performance.now();
-  // Server-side stats (loss%, stuck-time, encoder, decoder) are pulled
-  // from /stats; updated independently so a slow fetch doesn't gap the
-  // local fps/bitrate readout.
-  let serverStats = {loss_pct: 0, stuck_s: 0, decoder: "", encoder: ""};
-  setInterval(async () => {
-    try {
-      const r = await fetch("/stats", {cache: "no-store"});
-      if (r.ok) serverStats = await r.json();
-    } catch (e) { /* keep last */ }
-  }, 1000);
+  // Server-side stats (loss%, stuck-time, encoder, decoder) arrive as
+  // "server_stats" lines on the input stream (HPG fork; was GET /stats).
   setInterval(() => {
     const ms = decoder ? (decoder.decodeQueueSize ?? 0) : 0;
     if (decoderErrored) return;

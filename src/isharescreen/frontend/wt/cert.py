@@ -96,6 +96,17 @@ def make_self_signed(common_name: str = "localhost") -> tuple[bytes, bytes, str]
     return cert_pem, key_pem, sha256_hex
 
 
+def _write_private(path: Path, data: bytes) -> None:
+    """HPG fork: the TLS private key is readable by its owner only (0600);
+    upstream wrote it with the default umask (usually 0644)."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.chmod(str(path), 0o600)
+
+
 def write_cert(
     cache_dir: Optional[Path] = None,
     *, common_name: str = "iss-bridge",
@@ -115,13 +126,17 @@ def write_cert(
                 if cert.not_valid_after_utc > _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=1):
                     cert_der = cert.public_bytes(serialization.Encoding.DER)
                     sha256_hex = hashlib.sha256(cert_der).hexdigest()
+                    try:
+                        os.chmod(str(key_p), 0o600)   # tighten an older 0644 key
+                    except OSError:
+                        pass
                     return cert_p, key_p, sha256_hex
             except Exception as e:
                 log.debug("cached cert unusable, regenerating: %s", e)
     cert_pem, key_pem, sha256_hex = make_self_signed(common_name)
     if cache_dir is not None:
         cert_p.write_bytes(cert_pem)
-        key_p.write_bytes(key_pem)
+        _write_private(key_p, key_pem)
         return cert_p, key_p, sha256_hex
     # No cache requested — write to a temp location.
     import tempfile
@@ -129,7 +144,7 @@ def write_cert(
     cert_p = tmp / "wt.crt"
     key_p = tmp / "wt.key"
     cert_p.write_bytes(cert_pem)
-    key_p.write_bytes(key_pem)
+    _write_private(key_p, key_pem)
     return cert_p, key_p, sha256_hex
 
 

@@ -10,12 +10,21 @@ viewer page on `GET /`, and per WT session:
   - Accept one bidirectional stream from client carrying JSON input
     events (mouse, key, scroll).
 
-Multi-viewer fan-out: one iss `Session` + one libx264 encoder produce
-encoded NALU bytes once per frame; the bytes are written to every
-active WebTransport session in parallel.
+Multi-viewer fan-out: one iss `Session` receives Apple's H.264 access
+units and forwards them unchanged (no re-encode) to every active
+WebTransport session in parallel.
 
 The handshake puts the cert SHA-256 fingerprint in the URL so the
 browser passes it to `serverCertificateHashes` and skips CA validation.
+
+Changed by the HPG fork (https://github.com/silvercyrex/iShareScreen),
+2026-11: viewers must present a ticket/token before they count (see
+hpg.py); listen address is configurable (default loopback); view-only
+viewers and at most one controlling viewer; no POST /log or GET /stats
+(diagnostics and stats travel over the authenticated stream); launcher
+events on stdout; clean SIGTERM; no retry after a refused Mac login;
+the Mac session lingers briefly after the last viewer; re-entrant
+viewer lock (late joiners deadlocked the event loop).
 """
 from __future__ import annotations
 
@@ -50,6 +59,7 @@ from ...proxy.media.avc import _patch_avc_sps_dpb
 from .audio import OpusEncoder
 from .capsule import CapsuleType, H3Capsule, H3CapsuleDecoder
 from .cert import write_cert, trust_cert_in_keychain, is_cert_trusted
+from .hpg import AdmissionError, EventSink, TokenVerifier, clean_log_text
 
 
 log = logging.getLogger(__name__)
@@ -161,6 +171,11 @@ _PROFILE = os.environ.get("ISS_WT_PROFILE", "0") == "1"
 # wait for the next periodic intra-refresh column to complete.
 _FORCE_KEYFRAME_ON_JOIN = True
 
+# HPG fork: admission limits.
+_AUTH_TIMEOUT_S = 5.0          # a viewer must send its ticket within this
+_MAX_PENDING = 8               # unauthenticated WebTransport sessions at once
+_MAX_SESSION_ATTEMPTS = 3      # Mac session start tries (never on bad login)
+
 
 class _ViewerSession:
     """Per-browser-tab state — the WT session, the bidi input stream,
@@ -172,6 +187,8 @@ class _ViewerSession:
         "input_callback", "dgrams_sent", "last_seen_t",
         "video_stream_id", "frames_dropped", "video_discontinuity",
         "capsule_decoder", "use_single_stream", "request_keyframe",
+        # HPG fork: admission + per-viewer rights.
+        "admission", "read_only", "joined_t", "close_cb",
     )
 
     def __init__(
@@ -224,6 +241,29 @@ class _ViewerSession:
         # single-stream reset-on-backlog path to resync after discarding a
         # stale backlog. None in contexts without a bridge (e.g. tests).
         self.request_keyframe = request_keyframe
+        # HPG fork: None until the viewer's first input line carried a valid
+        # ticket/token. Until then it gets no frames and is not counted, so it
+        # cannot make the bridge log in to the Mac.
+        self.admission = None
+        self.read_only = True
+        self.joined_t = 0.0
+        # Set by the protocol: actively ends this viewer's WebTransport session.
+        self.close_cb = None
+
+    def send_control(self, obj: dict) -> None:
+        """HPG fork: server→page JSON line on the viewer's input stream (auth
+        result, rights, server stats). Replaces the unauthenticated /stats."""
+        if self.input_stream_id is None:
+            return
+        try:
+            self.h3._quic.send_stream_data(
+                stream_id=self.input_stream_id,
+                data=(json.dumps(obj, separators=(",", ":")) + "\n").encode(),
+                end_stream=False,
+            )
+            self.transmit()
+        except Exception as e:
+            log.debug("control send failed (viewer %d): %s", self.session_id, e)
 
     def send_frame(self, payload: bytes) -> None:
         """Deliver one encoded-frame envelope to the browser.
@@ -360,6 +400,12 @@ class _ViewerSession:
         records as they arrive."""
         self.last_seen_t = time.monotonic()
         self.input_buffer.extend(data)
+        if self.admission is None and len(self.input_buffer) > 8192:
+            # HPG fork: an unadmitted viewer gets no room to stream junk.
+            self.input_buffer.clear()
+            if self.close_cb is not None:
+                self.close_cb()
+            return
         while True:
             nl = self.input_buffer.find(b"\n")
             if nl < 0:
@@ -373,8 +419,10 @@ class _ViewerSession:
             except Exception as e:
                 log.warning("bad input json: %s — %s", e, line[:80])
                 continue
+            if not isinstance(msg, dict):
+                continue
             try:
-                self.input_callback(msg)
+                self.input_callback(msg, self)
             except Exception as e:
                 log.warning("input callback raised: %s on %s", e, msg.get("type"))
 
@@ -486,6 +534,16 @@ class _BridgeProtocol(QuicConnectionProtocol):
             log.info("WT viewer %d disconnected (total=%d)",
                      viewer.session_id, len(self._bridge.viewers))
 
+    def _end_viewer_session(self, viewer: "_ViewerSession") -> None:
+        """HPG fork: actively end a viewer's WebTransport session (FIN on the
+        CONNECT stream), e.g. no ticket in time, owner left, session ended."""
+        try:
+            self._quic.send_stream_data(viewer.stream_id, b"", end_stream=True)
+            self.transmit()
+        except Exception as e:
+            log.debug("end viewer %d: %s", viewer.session_id, e)
+        self._close_viewer(viewer)
+
     # -- request handlers ---------------------------------------------
 
     def _accept_webtransport(
@@ -521,15 +579,21 @@ class _BridgeProtocol(QuicConnectionProtocol):
             use_single_stream=use_single_stream,
             request_keyframe=self._bridge.request_keyframe,
         )
+        viewer.close_cb = lambda v=viewer: self._end_viewer_session(v)
         self._viewers[stream_id] = viewer
-        self._bridge.add_viewer(viewer)
-        log.info("WT viewer %d connected (total=%d, transport=%s)",
-                 stream_id, len(self._bridge.viewers),
-                 "single-stream" if use_single_stream else "per-frame")
+        # HPG fork: not counted (no frames, no Mac login) until the first input
+        # line carries a valid ticket/token; ended if none arrives in time.
+        if not self._bridge.register_pending(viewer):
+            self._end_viewer_session(viewer)
+            return
+        log.info("WT viewer %d connected, waiting for its ticket (transport=%s)",
+                 stream_id, "single-stream" if use_single_stream else "per-frame")
 
     def _serve_get(self, stream_id: int, path: str) -> None:
         assert self._h3 is not None
-        if path == "/" or path == "":
+        if not self._bridge.serve_page:
+            self._send_status(stream_id, 404, b"")
+        elif path == "/" or path == "":
             html = (_STATIC_DIR / "index.html").read_bytes()
             self._send_response(stream_id, 200, b"text/html; charset=utf-8", html)
         elif path == "/cert-hash":
@@ -559,6 +623,7 @@ class _BridgeProtocol(QuicConnectionProtocol):
     def connection_lost(self, exc: Optional[BaseException]) -> None:
         for viewer in list(self._viewers.values()):
             self._bridge.remove_viewer(viewer)
+        self._viewers.clear()
         super().connection_lost(exc)
 
 
@@ -575,9 +640,39 @@ class WebTransportBridge:
         framerate: int = 60,
         tile3_crop_rows: int = 0,
         trust_cert_for_safari: bool = False,
+        bind: str = "127.0.0.1",
+        admission=None,
+        events: Optional[EventSink] = None,
+        serve_page: bool = True,
+        view_only: bool = False,
+        linger_s: float = 15.0,
+        idle_timeout_s: float = 0.0,
+        exit_after_session: bool = False,
+        source_url: str = "",
     ) -> None:
         self._config = config
         self._port = port
+        # HPG fork: listen only where told (upstream: every interface).
+        self._bind = bind
+        # TicketVerifier (launcher) or TokenVerifier (local); never None.
+        self._admission = admission if admission is not None else TokenVerifier()
+        self._events = events or EventSink(False)
+        self.serve_page = serve_page
+        self._view_only = view_only
+        self._linger_s = max(0.0, linger_s)
+        self._idle_timeout_s = max(0.0, idle_timeout_s)
+        self._exit_after_session = exit_after_session
+        self.source_url = source_url
+        self._pending: set = set()
+        self._controller = None          # the one viewer allowed to send input
+        self._owner = None               # first admitted, non-joiner viewer
+        self._linger_handle = None
+        self._last_input_t = time.monotonic()
+        self._stop_event: Optional[asyncio.Event] = None
+        self._end_reason = ""
+        self._exit_code = 0
+        self._session_attempts = 0
+        self._mac_connected_t = 0.0
         # Opt-in: install our self-signed cert into the macOS login
         # keychain so Safari (which ignores serverCertificateHashes) can
         # do WebTransport. Set True once trusted — the page then connects
@@ -590,7 +685,11 @@ class WebTransportBridge:
         # specific count for tuning.
         self._tile3_crop_override = tile3_crop_rows
         self.viewers: list[_ViewerSession] = []
-        self._viewers_lock = threading.Lock()
+        # HPG fork: re-entrant. add_viewer() replays the cached config and
+        # keyframe to a late joiner via _broadcast_frame(), which takes this
+        # lock again; with a plain Lock that deadlocked the event loop for
+        # anyone joining a running session.
+        self._viewers_lock = threading.RLock()
         self._session: Optional[Session] = None
         # Pass-through: no encoder/compose pump. AUs forwarded via _on_video_au.
         self._config_sent: bool = False
@@ -646,6 +745,16 @@ class WebTransportBridge:
         )
         config.load_cert_chain(str(cert_path), str(key_path))
         self._loop = asyncio.get_running_loop()
+        self._stop_event = asyncio.Event()
+        # HPG fork: clean stop on SIGTERM/SIGINT (the launcher ends sessions so).
+        import signal as _signal
+        for sig in (_signal.SIGTERM, _signal.SIGINT):
+            try:
+                self._loop.add_signal_handler(
+                    sig, lambda s=sig: self.stop(
+                        "terminated" if s == _signal.SIGTERM else "interrupted"))
+            except (NotImplementedError, RuntimeError):
+                pass  # Windows: no loop signal handlers; KeyboardInterrupt path remains
         # Watchdog: evict viewers that have gone silent. Browsers send
         # stats every ~1s and input datagrams whenever the user moves;
         # 5+ seconds of zero traffic = tab almost certainly closed
@@ -661,8 +770,31 @@ class WebTransportBridge:
                 for v in stale:
                     log.info("evicting stale viewer %d (last_seen=%.1fs ago)",
                              v.session_id, now - v.last_seen_t)
-                    self.remove_viewer(v)
+                    self._end(v)
+                # HPG fork: viewers that never presented a ticket.
+                for v in [v for v in list(self._pending)
+                          if now - v.last_seen_t > _AUTH_TIMEOUT_S]:
+                    log.info("viewer %d sent no valid ticket in %.0fs — closing",
+                             v.session_id, _AUTH_TIMEOUT_S)
+                    self._pending.discard(v)
+                    self._end(v)
+                # HPG fork: optional idle limit (no input from anyone).
+                if (self._idle_timeout_s and self.viewers
+                        and now - self._last_input_t > self._idle_timeout_s):
+                    self.stop("idle")
         asyncio.create_task(_viewer_watchdog())
+
+        # HPG fork: server stats go to admitted viewers over their own
+        # (authenticated) input stream, replacing the open GET /stats.
+        async def _stats_push():
+            while True:
+                await asyncio.sleep(1.0)
+                stats = self._server_stats()
+                with self._viewers_lock:
+                    targets = list(self.viewers)
+                for v in targets:
+                    v.send_control({"type": "server_stats", **stats})
+        asyncio.create_task(_stats_push())
 
         # Two listeners:
         #   port (UDP)  — WebTransport / HTTP/3 over QUIC. Browsers use
@@ -676,47 +808,55 @@ class WebTransportBridge:
         # to both ::1 and 127.0.0.1 and prefers ::1 — without an IPv6
         # listener it sees ICMP port-unreachable and reports the WT
         # connect as ERR_CONNECTION_REFUSED without trying IPv4.
-        await quic_serve(
-            host="::",
-            port=self._port,
-            configuration=config,
-            create_protocol=lambda *a, **kw: _BridgeProtocol(
-                *a, bridge=self, **kw,
-            ),
+        # HPG fork: listen only on the configured address. Upstream bound
+        # `::` and `0.0.0.0` unconditionally (reachable from every network).
+        # The loopback default keeps the local http://localhost flow: Chrome
+        # resolves localhost to ::1 first, so loopback also listens on ::1.
+        hosts = [self._bind]
+        if self._bind in ("127.0.0.1", "localhost"):
+            hosts = ["127.0.0.1", "::1"]
+        for i, host in enumerate(hosts):
+            try:
+                await quic_serve(
+                    host=host,
+                    port=self._port,
+                    configuration=config,
+                    create_protocol=lambda *a, **kw: _BridgeProtocol(
+                        *a, bridge=self, **kw,
+                    ),
+                )
+            except OSError as e:
+                if i == 0:
+                    raise
+                log.debug("listener on %s skipped: %s", host, e)
+        if self.serve_page:
+            await self._start_http_bootstrap(hosts)
+        log.info("WebTransport bridge ready on udp %s:%d", self._bind, self._port)
+        log.info("server cert sha256 = %s", self.cert_sha256)
+        if isinstance(self._admission, TokenVerifier) and self.serve_page:
+            # Local mode: the token rides in the URL fragment, which the
+            # browser never sends to any server.
+            host = "localhost" if self._bind in ("127.0.0.1", "localhost") else self._bind
+            log.info("  open in Chrome/Edge/Firefox: http://%s:%d/#token=%s",
+                     host, self._port, self._admission.token)
+        self._events.emit(
+            "ready", bind=self._bind, udp_port=self._port,
+            cert_sha256=self.cert_sha256, source_url=self.source_url,
+            **({"token": self._admission.token}
+               if isinstance(self._admission, TokenVerifier) else {}),
         )
-        # Also bind a separate IPv4 listener — `::` dual-stack is the
-        # default on Linux/macOS but aioquic creates a single socket;
-        # if dual-stack is disabled (Windows, hardened Linux) we still
-        # need an explicit v4 socket.
-        try:
-            await quic_serve(
-                host="0.0.0.0",
-                port=self._port,
-                configuration=config,
-                create_protocol=lambda *a, **kw: _BridgeProtocol(
-                    *a, bridge=self, **kw,
-                ),
-            )
-        except OSError as e:
-            log.debug("v4 bind skipped (dual-stack already covers it): %s", e)
-        await self._start_http_bootstrap()
-        # Use localhost, not the LAN IP: Chrome/Edge only expose WebTransport in
-        # a secure context, and http://localhost qualifies while http://<LAN-IP>
-        # does not. localhost also matches the self-signed cert (cert.py issues
-        # it for localhost / 127.0.0.1, not the LAN address), and the dual-stack
-        # listeners above exist precisely so localhost (::1 / 127.0.0.1) works.
-        url = f"http://localhost:{self._port}/"
-        log.info("WebTransport bridge ready:")
-        log.info("  open this URL in Chrome/Edge/Firefox: %s", url)
-        log.info("  (HTML on tcp/%d, WebTransport on udp/%d)",
-                 self._port, self._port)
-        await asyncio.Event().wait()
+        await self._stop_event.wait()
 
-    async def _start_http_bootstrap(self) -> None:
+    async def _start_http_bootstrap(self, hosts: list) -> None:
         """Tiny aiohttp server that delivers the viewer page + cert
         hash over plain HTTP on the same port number (different
         protocol — TCP vs UDP, so no conflict). Eliminates the
-        Chrome self-signed-cert warning page."""
+        Chrome self-signed-cert warning page.
+
+        HPG fork: only in local mode (--no-page for the launcher, whose page
+        comes from its own HTTPS origin), bound to the configured address,
+        and without the unauthenticated POST /log and GET /stats (both now go
+        over the viewer's authenticated WebTransport stream)."""
         nocache = {
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
@@ -745,7 +885,8 @@ class WebTransportBridge:
                  # In dynamic ("Auto") mode the page reports its window size so
                  # the host re-encodes to match; a fixed --advertise is left
                  # untouched (respect the user's explicit resolution choice).
-                 "dynamic": bool(self._config.dynamic_resolution)}, headers=nocache,
+                 "dynamic": bool(self._config.dynamic_resolution),
+                 "sourceUrl": self.source_url}, headers=nocache,
             )
 
         async def audio_worklet(_req: web.Request) -> web.Response:
@@ -755,75 +896,148 @@ class WebTransportBridge:
                 headers=nocache,
             )
 
-        async def log_event(req: web.Request) -> web.Response:
-            """Browser-side error/log relay so console messages are
-            visible to the iss operator."""
-            try:
-                payload = await req.json()
-                level = payload.get("level", "info")
-                msg = payload.get("msg", "")
-                logf = log.error if level == "error" else log.info
-                logf("browser-log [%s]: %s", level, msg)
-            except Exception as e:
-                log.debug("log_event error: %s", e)
-            return web.Response(text="ok", headers=nocache)
-
-        async def stats_endpoint(req: web.Request) -> web.Response:
-            """Server-side debug stats for the browser's overlay bar.
-            Polled ~1×/s; intentionally cheap to compute. Includes the
-            signals the operator needs to diagnose stuck/gray streams
-            (last_publish_age, per-tile loss, hw decoder, viewers).
-            Browser-side metrics like `decode_fps` and `gray_frac`
-            are owned by the page and not duplicated here."""
-            sess = self._session
-            decoder = "?"
-            rcv = lost = 0
-            last_age = -1.0
-            lost_per_tile: list[int] = []
-            if sess is not None:
-                try:
-                    decoder = sess.hw_accel or "software"
-                    rcv, lost = sess.packet_stats
-                    last_age = sess.last_publish_age_s
-                    lost_per_tile = sess.lost_pkts_per_tile
-                except Exception as e:
-                    log.debug("stats_endpoint sess read failed: %s", e)
-            payload = {
-                "decoder": decoder,
-                "loss_pct": round((lost / rcv * 100.0) if rcv > 0 else 0.0, 2),
-                "loss_per_tile": lost_per_tile,
-                "stuck_s": round(max(0.0, last_age), 1),
-                "viewers": len(self.viewers),
-                "encoder": "passthrough-h264",
-            }
-            return web.json_response(payload, headers=nocache)
-
         app = web.Application()
         app.router.add_get("/", index)
         app.router.add_get("/cert-hash", cert_hash)
         app.router.add_get("/wt-config", wt_config)
         app.router.add_get("/audio-worklet.js", audio_worklet)
-        app.router.add_post("/log", log_event)
-        app.router.add_get("/stats", stats_endpoint)
-        runner = web.AppRunner(app, access_log=None)  # don't log every /stats poll
+        runner = web.AppRunner(app, access_log=None)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self._port)
-        await site.start()
+        for host in hosts:
+            try:
+                await web.TCPSite(runner, host, self._port).start()
+            except OSError as e:
+                log.debug("page listener on %s skipped: %s", host, e)
         self._http_runner = runner
-        log.info("server cert sha256 = %s", self.cert_sha256)
 
     def run(self) -> int:
         try:
             asyncio.run(self.run_async())
         except KeyboardInterrupt:
-            pass
+            self._end_reason = self._end_reason or "interrupted"
         finally:
             self._teardown_session()
-        return 0
+        if self._exit_code:
+            import sys as _sys
+            print(f"iss bridge: {self._end_reason}", file=_sys.stderr)
+        return self._exit_code
+
+    # -- HPG fork: admission, rights, lifecycle ------------------------
+
+    def register_pending(self, viewer: _ViewerSession) -> bool:
+        """A WebTransport session opened; it must authenticate before it
+        counts. Refuse when too many are already waiting (cheap DoS guard)."""
+        if self._stop_event is not None and self._stop_event.is_set():
+            return False
+        if len(self._pending) >= _MAX_PENDING:
+            log.warning("too many unauthenticated viewers waiting; refusing one")
+            return False
+        self._pending.add(viewer)
+        return True
+
+    def _authenticate(self, viewer: _ViewerSession, msg: dict) -> None:
+        self._pending.discard(viewer)
+        try:
+            if msg.get("type") != "auth":
+                raise AdmissionError("first message must be the ticket")
+            if "ticket" in msg and hasattr(self._admission, "_key"):
+                adm = self._admission.check(str(msg["ticket"]))
+            elif "token" in msg and isinstance(self._admission, TokenVerifier):
+                adm = self._admission.check(str(msg["token"]))
+            else:
+                raise AdmissionError("wrong kind of credential")
+        except AdmissionError as e:
+            log.warning("viewer %d refused: %s", viewer.session_id, e)
+            viewer.send_control({"type": "auth_failed", "reason": str(e)})
+            self._end(viewer)
+            return
+        viewer.admission = adm
+        viewer.joined_t = time.monotonic()
+        # Rights: view-only if the ticket says so, the bridge is view-only, or
+        # someone else already has control (at most one controlling viewer).
+        ro = adm.read_only or self._view_only
+        if not ro and self._controller is not None and self._controller in self.viewers:
+            log.info("viewer %d asked for control but viewer %d has it; view-only",
+                     viewer.session_id, self._controller.session_id)
+            ro = True
+        viewer.read_only = ro
+        if not ro:
+            self._controller = viewer
+        if self._owner is None and not adm.is_joiner:
+            self._owner = viewer
+        viewer.send_control({"type": "auth_ok", "read_only": ro,
+                             "source_url": self.source_url})
+        self._events.emit("viewer_joined", user=adm.user, sid=adm.sid,
+                          read_only=ro, viewers=len(self.viewers) + 1)
+        self._events.user_connected(adm.user)
+        log.info("viewer %d admitted: user=%r sid=%r %s", viewer.session_id,
+                 adm.user, adm.sid, "view-only" if ro else "control")
+        self.add_viewer(viewer)
+
+    def _end(self, viewer: _ViewerSession) -> None:
+        """End one viewer's WebTransport session (and count it as gone)."""
+        if viewer.close_cb is not None:
+            viewer.close_cb()          # → protocol → remove_viewer
+        else:
+            self.remove_viewer(viewer)
+
+    def stop(self, reason: str, exit_code: int = 0) -> None:
+        """End the whole bridge: all viewers, the Mac session, the process."""
+        loop = self._loop
+        if loop is not None and threading.current_thread() is not threading.main_thread():
+            loop.call_soon_threadsafe(self.stop, reason, exit_code)
+            return
+        if self._stop_event is None or self._stop_event.is_set():
+            return
+        self._end_reason = reason
+        self._exit_code = exit_code
+        # Set first: ending viewers below must not schedule a linger timer.
+        self._stop_event.set()
+        self._cancel_linger()
+        log.info("bridge stopping: %s", reason)
+        for v in list(self._pending) + list(self.viewers):
+            v.send_control({"type": "ended", "reason": reason})
+            self._end(v)
+        self._pending.clear()
+        self._teardown_session()
+        self._events.emit("ended", reason=reason, exit_code=exit_code)
+
+    def _server_stats(self) -> dict:
+        sess = self._session
+        decoder, rcv, lost, last_age = "?", 0, 0, -1.0
+        if sess is not None:
+            try:
+                decoder = sess.hw_accel or "software"
+                rcv, lost = sess.packet_stats
+                last_age = sess.last_publish_age_s
+            except Exception as e:
+                log.debug("stats read failed: %s", e)
+        return {
+            "decoder": decoder,
+            "loss_pct": round((lost / rcv * 100.0) if rcv > 0 else 0.0, 2),
+            "stuck_s": round(max(0.0, last_age), 1),
+            "viewers": len(self.viewers),
+            "encoder": "passthrough-h264",
+        }
+
+    def _cancel_linger(self) -> None:
+        if self._linger_handle is not None:
+            self._linger_handle.cancel()
+            self._linger_handle = None
+
+    def _linger_expired(self) -> None:
+        self._linger_handle = None
+        with self._viewers_lock:
+            if self.viewers:
+                return
+        self._teardown_session()
+        if self._exit_after_session:
+            self.stop("viewer left")
 
     # -- viewer management --------------------------------------------
 
     def add_viewer(self, viewer: _ViewerSession) -> None:
+        self._cancel_linger()
         with self._viewers_lock:
             self.viewers.append(viewer)
             if self._session is None and not self._session_starting:
@@ -857,15 +1071,43 @@ class WebTransportBridge:
                         pass
 
     def remove_viewer(self, viewer: _ViewerSession) -> None:
+        self._pending.discard(viewer)
         with self._viewers_lock:
             try:
                 self.viewers.remove(viewer)
             except ValueError:
                 return
-            log.info("WT viewer %d disconnected (remaining=%d)",
-                     viewer.session_id, len(self.viewers))
-            if not self.viewers:
-                self._teardown_session()
+            remaining = len(self.viewers)
+        log.info("WT viewer %d disconnected (remaining=%d)",
+                 viewer.session_id, remaining)
+        adm = viewer.admission
+        if adm is not None:
+            dur_ms = int((time.monotonic() - viewer.joined_t) * 1000)
+            reason = self._end_reason or "viewer left"
+            self._events.emit("viewer_left", user=adm.user, sid=adm.sid,
+                              duration_ms=dur_ms, viewers=remaining)
+            self._events.user_disconnected(adm.user, dur_ms, reason)
+        if viewer is self._controller:
+            self._controller = None
+        if viewer is self._owner:
+            # HPG fork (relay semantics): when the session owner leaves, the
+            # joiners go too.
+            self._owner = None
+            for v in list(self.viewers):
+                if v.admission is not None and v.admission.is_joiner:
+                    v.send_control({"type": "ended", "reason": "session owner left"})
+                    self._end(v)
+        if remaining == 0 and not self.viewers:
+            # Keep the Mac session briefly so a page reload doesn't force a
+            # fresh Mac login (and, for an own-session login, re-trigger the
+            # alt-session reconnect path).
+            if self._linger_s and self._loop is not None and \
+                    (self._stop_event is None or not self._stop_event.is_set()):
+                self._cancel_linger()
+                self._linger_handle = self._loop.call_later(
+                    self._linger_s, self._linger_expired)
+            else:
+                self._linger_expired()
 
     def request_keyframe(self) -> None:
         """Rate-limited FIR request, shared by recovery paths (decoder reset,
@@ -941,9 +1183,33 @@ class WebTransportBridge:
                 self._gate_thread = threading.Thread(
                     target=self._gate_pump_loop, name="wt-gate-pump", daemon=True)
                 self._gate_thread.start()
+            self._session_attempts = 0
+            self._mac_connected_t = time.monotonic()
+            self._events.emit("mac_connected", host=self._config.host,
+                              user=self._config.username)
         except Exception as e:
-            log.error("session start failed: %s — retrying in 1.5 s", e)
             self._session_starting = False
+            self._session_attempts += 1
+            # HPG fork: never retry a refused login — upstream retried every
+            # 1.5 s for as long as a viewer stayed, each try counting as more
+            # failed logins on the Mac (account lockout). Session-select
+            # refusals (no right to share without asking, popup unanswered)
+            # don't heal on retry either. Other failures get bounded retries.
+            from ...proxy.protocol.auth import AuthError as _AuthError
+            if isinstance(e, _AuthError):
+                log.error("Mac login failed: %s", e)
+                self.stop(f"Mac login failed: {e}", exit_code=2)
+                return
+            if "session-select" in str(e):
+                log.error("session start refused: %s", e)
+                self.stop(str(e), exit_code=3)
+                return
+            if self._session_attempts >= _MAX_SESSION_ATTEMPTS:
+                log.error("session start failed %d times: %s",
+                          self._session_attempts, e)
+                self.stop(f"could not start the screen stream: {e}", exit_code=1)
+                return
+            log.error("session start failed: %s — retrying in 1.5 s", e)
             # Auto-retry: schedule another start attempt while we still
             # have at least one viewer connected. Apple's burst is
             # transient — VPS/SPS/PPS sometimes don't survive the first
@@ -1142,6 +1408,7 @@ class WebTransportBridge:
             loop.call_soon_threadsafe(viewer.send_frame, envelope)
 
     def _teardown_session(self) -> None:
+        had_session = self._session is not None
         pump_stop = getattr(self, "_pump_stop", None)
         if pump_stop is not None:
             pump_stop.set()
@@ -1166,7 +1433,9 @@ class WebTransportBridge:
             self._session.close()
             self._session = None
         self._session_starting = False
-        log.info("iss session torn down (no viewers)")
+        if had_session:
+            self._events.emit("mac_disconnected")
+        log.info("iss session torn down")
 
     # -- input handling -----------------------------------------------
 
@@ -1176,6 +1445,10 @@ class WebTransportBridge:
         viewer.last_seen_t = time.monotonic()
         if self._session is None:
             return
+        # HPG fork: pointer input only from the one viewer with control.
+        if viewer.admission is None or viewer.read_only:
+            return
+        self._note_input(viewer)
         if len(data) != 13 or data[0] != 0x10:
             log.debug("input datagram: bad len=%d type=%d", len(data), data[0] if data else -1)
             return
@@ -1193,9 +1466,30 @@ class WebTransportBridge:
         except Exception as e:
             log.debug("mouse datagram dispatch error: %s", e)
 
-    def handle_input_event(self, msg: dict) -> None:
+    def _note_input(self, viewer: _ViewerSession) -> None:
+        self._last_input_t = time.monotonic()
+        if viewer.admission is not None:
+            self._events.user_active(viewer.admission.user)
+
+    def handle_input_event(self, msg: dict, viewer=None) -> None:
         """Dispatch one decoded JSON input event to the iss session."""
+        # HPG fork: the first line from a viewer is its credential.
+        if viewer is not None and viewer.admission is None:
+            self._authenticate(viewer, msg)
+            return
         kind = msg.get("type")
+        if kind == "log":
+            # Browser diagnostics, now over the authenticated stream (was an
+            # open POST /log). One bounded line, at debug unless an error.
+            logf = log.warning if msg.get("level") == "error" else log.debug
+            logf("browser[%s]: %s", getattr(viewer, "session_id", "?"),
+                 clean_log_text(msg.get("msg", "")))
+            return
+        if viewer is not None and viewer.read_only and kind not in (
+                "keyframe", "stats"):
+            return  # view-only: no mouse, keys, scroll, resize, resolution
+        if kind not in ("keyframe", "stats") and viewer is not None:
+            self._note_input(viewer)
         if kind == "keyframe":
             # A browser decoder reset and needs a fresh keyframe to restart.
             # macOS answers a FIR with an IDR in ~75ms, so send one per reset.
@@ -1509,9 +1803,12 @@ def _cursor_envelope(width: int, height: int, hx: int, hy: int, rgba: bytes) -> 
 # ── module entry ─────────────────────────────────────────────────────
 
 def run(config: SessionConfig, *, port: int = 4433,
-        trust_cert_for_safari: bool = False, **_unused: object) -> int:
+        trust_cert_for_safari: bool = False, **bridge_opts: object) -> int:
+    """`bridge_opts` (HPG fork): bind, admission, events, serve_page,
+    view_only, linger_s, idle_timeout_s, exit_after_session, source_url."""
     return WebTransportBridge(
         config, port=port, trust_cert_for_safari=trust_cert_for_safari,
+        **bridge_opts,
     ).run()
 
 
