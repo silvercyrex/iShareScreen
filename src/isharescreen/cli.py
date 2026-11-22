@@ -191,6 +191,11 @@ def _make_parser() -> argparse.ArgumentParser:
         "the Mac password",
     )
     g.add_argument(
+        "--exit-on-stdin-close", action="store_true",
+        help="end the session and exit when stdin is closed: a launcher's "
+        "stop signal that also works on Windows (keep stdin open as a pipe)",
+    )
+    g.add_argument(
         "--app-browser", default="", metavar="PATH",
         help="with --app: the Chromium-family browser to open (default: Edge "
         "on Windows, else Chrome/Chromium; else the default browser)",
@@ -635,6 +640,7 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
         source_url=args.source_url,
         app=args.app,
         app_browser=args.app_browser,
+        exit_on_stdin_close=args.exit_on_stdin_close,
         password_from_page=args.app and not config.password,
         mac_name=args.connection_name or args.host or config.host,
     )

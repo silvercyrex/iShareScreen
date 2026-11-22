@@ -128,3 +128,19 @@ def test_entry_routes_app_flags_to_the_cli(monkeypatch):
         monkeypatch.setattr("sys.argv", ["iss"] + argv)
         assert entry.main() == 0
     assert called == [True, True]
+
+
+def test_stdin_close_stops():
+    import io
+    from isharescreen.frontend.wt.server import watch_stdin_close
+    calls = []
+    watch_stdin_close(io.BytesIO(b"anything\nmore"), lambda: calls.append(1))
+    assert calls == [1]
+
+
+def test_launcher_stop_closes_the_window_at_once():
+    import inspect
+    from isharescreen.frontend.wt.server import WebTransportBridge
+    src = inspect.getsource(WebTransportBridge.run)
+    for reason in ("window closed", "viewer left", "terminated", "launcher closed"):
+        assert f'"{reason}"' in src

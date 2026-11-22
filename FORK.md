@@ -140,6 +140,9 @@ helping a person in their own session, and IT working in a separate session.
   during the handshake, so the relay learns their addresses. The relay
   must receive the Mac's media on UDP 5900/5901 of the address its TCP
   connection comes from.
+- `--exit-on-stdin-close`: a launcher keeps iss's stdin open as a pipe and
+  closes it to end the session (Windows has no SIGTERM). A stop by the
+  launcher (stdin closed or SIGTERM) or Ctrl+C closes the app window at once.
 - Tested on Linux (Chromium 156) through a stand-in relay with that
   contract: password form, wrong password, video, window close, cleanup.
   Windows not tested yet.

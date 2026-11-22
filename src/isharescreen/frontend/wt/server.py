@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 from collections import deque
@@ -89,6 +90,18 @@ _BROWSER_SPS_PATCH = os.environ.get("ISS_BROWSER_SPS_PATCH", "1") != "0"
 # each frame as soon as it is decoded instead of holding back up to 16 (see
 # _sps_signal_no_reorder). ISS_BROWSER_NO_REORDER=0 turns it off for A/B.
 _BROWSER_NO_REORDER = os.environ.get("ISS_BROWSER_NO_REORDER", "1") != "0"
+
+
+def watch_stdin_close(stream, on_close) -> None:
+    """HPG fork: block until the launcher closes our stdin, then call
+    on_close(). A stop signal that works on Windows too (no SIGTERM there)."""
+    try:
+        buf = getattr(stream, "buffer", stream)
+        while buf.read(4096):
+            pass
+    except (OSError, ValueError):
+        pass
+    on_close()
 
 
 def _int_or_dash(v) -> str:
@@ -799,6 +812,7 @@ class WebTransportBridge:
         app_browser: str = "",
         password_from_page: bool = False,
         mac_name: str = "",
+        exit_on_stdin_close: bool = False,
     ) -> None:
         # HPG fork: this frontend forwards the Mac's H.264 to the browsers and
         # never uses iss's own decode, so the session skips decoding the burst.
@@ -823,6 +837,7 @@ class WebTransportBridge:
         self._password_from_page = password_from_page
         self._pw_tries_left = 3
         self._mac_name = mac_name or config.host
+        self._exit_on_stdin_close = exit_on_stdin_close
         self._pending: set = set()
         self._controller = None          # the one viewer allowed to send input
         self._owner = None               # first admitted, non-joiner viewer
@@ -1069,6 +1084,12 @@ class WebTransportBridge:
             **({"token": self._admission.token}
                if isinstance(self._admission, TokenVerifier) else {}),
         )
+        if self._exit_on_stdin_close:
+            threading.Thread(
+                target=watch_stdin_close,
+                args=(sys.stdin, lambda: self.stop("launcher closed")),
+                name="stdin-watch", daemon=True,
+            ).start()
         if self._app and isinstance(self._admission, TokenVerifier):
             from .app import open_app_window
             url = f"http://{self._bind}:{self._port}/#token={self._admission.token}"
@@ -1148,10 +1169,12 @@ class WebTransportBridge:
         finally:
             self._teardown_session()
             if self._app_window is not None:
-                # Window closed or the page left: nothing to show. Otherwise
-                # the page shows why it ended; close it when the user does
-                # (at most 10 minutes later).
-                gone = self._end_reason in ("window closed", "viewer left")
+                # Window closed, page left, or the launcher/user stopped iss:
+                # close it now. Otherwise (the Mac side ended) the page shows
+                # why; close it when the user does (at most 10 minutes later).
+                gone = self._end_reason in (
+                    "window closed", "viewer left", "terminated", "interrupted",
+                    "launcher closed")
                 self._app_window.finish(wait_s=0 if gone else 600)
         if self._exit_code:
             import sys as _sys
