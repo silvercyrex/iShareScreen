@@ -49,7 +49,7 @@ log = logging.getLogger("iss.cli")
 
 # HPG fork: public source of this fork (AGPL section 13 "Source code" link).
 # A launcher should pass --source-url with the exact running commit.
-FORK_SOURCE_URL = "https://github.com/silvercyrex/iShareScreen"
+FORK_SOURCE_URL = "https://github.com/silvercyrex/iShareScreen/tree/hpg/fork-fixes"
 
 
 # ── argparse construction ────────────────────────────────────────────

@@ -5,7 +5,8 @@ This is HPG's fork of **iShareScreen** by renegadelink and contributors
 (2026-07-26). All credit for the client, the protocol work and the browser
 viewer goes to that project. This fork is licensed the same way:
 **AGPL-3.0-or-later** (see [LICENSE](LICENSE)). Its source is public at
-https://github.com/silvercyrex/iShareScreen.
+https://github.com/silvercyrex/iShareScreen on the `hpg/fork-fixes` branch
+(`main` is kept as an unchanged copy of upstream).
 
 HPG runs the browser viewer (`iss --frontend browser`, the "bridge") on its
 own remote-access gateway, one process per viewing session, started by HPG's

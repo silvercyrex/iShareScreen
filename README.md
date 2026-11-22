@@ -2,7 +2,9 @@
 
 > **HPG fork.** This is HPG's fork of iShareScreen by renegadelink and
 > contributors. What it changes and why: [FORK.md](FORK.md). Install this fork
-> from `git+https://github.com/silvercyrex/iShareScreen.git`; the instructions
+> from its `hpg/fork-fixes` branch
+> (`git+https://github.com/silvercyrex/iShareScreen.git@hpg/fork-fixes`); `main`
+> is an unchanged copy of upstream. The instructions
 > below are upstream's.
 
 Cross-platform Python client for Apple's macOS Screen Sharing **High
