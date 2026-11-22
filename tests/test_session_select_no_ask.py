@@ -125,3 +125,31 @@ def test_no_prompt_returns_none(monkeypatch):
     assert neg._phase_session_select(
         _FakeSock(), mode="alt_session",
         username="u", password="p", ecb_key=b"\x00" * 16) is None
+
+
+class _Stop(Exception):
+    pass
+
+
+def _negotiate_without_prompt(monkeypatch, **kw):
+    monkeypatch.setattr(neg, "_phase_auth", lambda *a, **k: (_FakeSock(), b"\x00" * 16))
+    monkeypatch.setattr(neg, "_phase_client_init", lambda s: (1920, 1080))
+    monkeypatch.setattr(neg, "_peek_ss_prompt", lambda s, *a, **k: False)
+
+    def handshake(*a, **k):
+        raise _Stop()
+    monkeypatch.setattr(neg, "_phase_handshake_plaintext", handshake)
+    return neg.connect_and_negotiate("mac", 5900, "u", "p", audio_offer=b"a",
+                                     video_offer=b"v", **kw)
+
+
+def test_alt_session_never_falls_back_to_the_console(monkeypatch):
+    # The Mac offers no session choice (its screen shows the login window):
+    # streaming the console here would put "my own session" keys into it.
+    with pytest.raises(RuntimeError, match="did not offer a separate session"):
+        _negotiate_without_prompt(monkeypatch, alt_session=True)
+
+
+def test_console_share_without_prompt_still_proceeds(monkeypatch):
+    with pytest.raises(_Stop):
+        _negotiate_without_prompt(monkeypatch, share_console=True)

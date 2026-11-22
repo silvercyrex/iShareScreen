@@ -753,7 +753,8 @@ def connect_and_negotiate(
     # for the normal handshake below; if present, route by flag (default
     # share-console = view their session; --alt-session = log in separately).
     existing_session = False
-    if _peek_ss_prompt(sock):
+    session_offered = _peek_ss_prompt(sock)
+    if session_offered:
         # Neither mode was forced and the launcher gave us a way to ask the
         # user (a different user is logged in at the host's console): prompt
         # now for share-console vs alt-session and route on their answer.
@@ -804,6 +805,19 @@ def connect_and_negotiate(
         )
         if alt_session and ack_delay is not None:
             existing_session = ack_delay < _SS_EXISTING_SESSION_ACK_S
+
+    if alt_session and not session_offered:
+        # HPG fork: the Mac offered no session choice (its screen is at the
+        # login window, or the account is the one at the screen). Upstream
+        # then carried on and streamed the CONSOLE although a separate session
+        # was asked for, so keys meant for "my own session" went into the
+        # login window on the Mac's screen (one failed AD login in the lab).
+        # Never fall back to the console here.
+        raise RuntimeError(
+            "session-select: the Mac did not offer a separate session (it is "
+            "showing its login window, or you are the user at its screen), so "
+            "your own session could not be opened; nothing was shared"
+        )
 
     if alt_session and existing_session:
         # HPG fork: reconnecting to the user's EXISTING session. Sending the
