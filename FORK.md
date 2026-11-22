@@ -115,6 +115,9 @@ helping a person in their own session, and IT working in a separate session.
   macOS) 282 ms from decode to output. Motion-to-photon on the LAN (mouse
   move in the page to the Mac's reaction on screen in the page) went from
   357 ms to 74 ms. `ISS_BROWSER_NO_REORDER=0` turns it off.
+- Mouse moves go out when Chrome reports them (`pointerrawupdate`, at most
+  every 4 ms) instead of at the next frame, saving up to one frame of
+  input delay. Other browsers keep the frame-aligned path.
 - Every 10 s the log has "frame timing": time from a frame's first packet
   to its hand-off to the viewers, and from there into the QUIC stream.
 

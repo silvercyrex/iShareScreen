@@ -1073,8 +1073,8 @@ async function main() {
   const dgrams = wt.datagrams;
   const dgWriter = (dgrams && dgrams.writable) ? dgrams.writable.getWriter() : null;
   if (!dgWriter) srvLog("info", "no datagram writer (Safari) — mouse moves go over the input stream");
-  let pendingMove = null;
-  function flushMove() {
+  let pendingMove = null, lastMoveSentT = 0;
+  function sendPendingMove() {
     if (pendingMove !== null && readOnly) pendingMove = null;  // HPG fork
     if (pendingMove !== null) {
       if (dgWriter) {
@@ -1091,7 +1091,11 @@ async function main() {
         send({type: "mouse", buttons: buttonMask, x: pendingMove[0], y: pendingMove[1]});
       }
       pendingMove = null;
+      lastMoveSentT = performance.now();
     }
+  }
+  function flushMove() {
+    sendPendingMove();
     requestAnimationFrame(flushMove);
   }
   requestAnimationFrame(flushMove);
@@ -1100,6 +1104,17 @@ async function main() {
     const xy = inWindowToCanvas(e);
     if (xy) pendingMove = xy;
   });
+  // HPG fork: Chrome delivers mousemove aligned to the next frame (up to one
+  // frame late); pointerrawupdate arrives as soon as the mouse moves. Send
+  // those at once, at most every 4 ms. Other browsers keep the frame path.
+  if ("onpointerrawupdate" in window) {
+    canvas.addEventListener("pointerrawupdate", (e) => {
+      const xy = inWindowToCanvas(e);
+      if (!xy) return;
+      pendingMove = xy;
+      if (performance.now() - lastMoveSentT >= 4) sendPendingMove();
+    });
+  }
   // Apple's button mask is non-standard: bit 0 = left, bit 1 = right,
   // bit 2 = middle (right and middle are SWAPPED from the RFB spec).
   // DOM `e.button`: 0 = left, 1 = middle, 2 = right.
