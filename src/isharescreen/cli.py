@@ -665,7 +665,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         # no traceback even in --verbose, distinct exit code.
         from isharescreen.proxy.protocol.auth import AuthError
         if isinstance(e, AuthError):
-            log.error("authentication failed — check username and password")
+            # HPG fork: say why (e.g. "this Mac may not offer SRP"), not only
+            # "check username and password".
+            log.error("authentication failed: %s", e)
             return 2
         log.error("fatal: %s", e)
         if args.verbose:
