@@ -93,6 +93,21 @@ helping a person in their own session, and IT working in a separate session.
   viewers. An embedding page may send `{type: "iss-keys", action:
   "toggle"|"tap"|"combo"|"clear", keys: [...]}`.
 
+**Session start and busy screens**
+- The bridge no longer decodes the Mac's whole opening burst before showing
+  anything: it never uses that decode (the browser decodes), and on
+  full-motion content (an animated lock screen) software decoding took about
+  12 s on a gateway without a GPU while the Mac's video went unread. Only the
+  burst's first keyframe is decoded now (0.2 s).
+- The media socket readers start right after the opening burst instead of
+  after the rest of the set-up.
+- The thread switch interval is 0.5 ms (`ISS_GIL_SWITCH_MS`). With Python's
+  default 5 ms, a busy process let the socket reader take only ~500 packets
+  per second, so the kernel dropped the Mac's start-up burst.
+- Logs: kernel drops on this session's video socket each second ("video
+  socket overflow"), their total in the `mac_disconnected` event
+  (`video_drops`), and every 10 s "cpu by thread".
+
 **Separate session safety**
 - `--alt-session` refuses when the Mac offers no session choice (its screen
   shows the login window). Upstream streamed the console instead, so keys
@@ -109,13 +124,15 @@ helping a person in their own session, and IT working in a separate session.
 - Includes upstream pull request #34 by Charles Vestal (not yet merged
   upstream): Apple's RCTL receiver rate feedback. With `ISS_RCTL=1` the
   bridge caps it at 80% of the slowest viewer's connection rate. Off by
-  default: its effect on the Mac's H.264 encoder is not measured yet.
+  default: in the lab (macOS 27, H.264) the Mac ignored it, sending 43-63
+  Mbit/s while asked for 4-5.
 
 **Settings (environment)**
 - `ISS_UDP_RCVBUF` (bytes, default 8 MB), `ISS_WT_MAX_BEHIND_MS` (500),
   `ISS_WT_RESUME_BEHIND_MS` (150), `ISS_WT_KEYFRAME_RETRY_MS` (1500),
   `ISS_WT_CONGESTION` (`reno`; `cubic` was worse in the lab),
-  `ISS_RCTL` (off), `ISS_WT_RCTL_SHARE` (0.8), `ISS_WT_RCTL_MIN_KBPS` (800).
+  `ISS_RCTL` (off), `ISS_WT_RCTL_SHARE` (0.8), `ISS_WT_RCTL_MIN_KBPS` (800),
+  `ISS_GIL_SWITCH_MS` (0.5).
 
 **Other**
 - `requirements.lock`: the exact, hashed set of dependencies tested together.
@@ -131,6 +148,11 @@ date. `src/isharescreen/frontend/wt/hpg.py` is new.
   are not possible (the Mac always streams to UDP 5900/5901). Different Macs
   at the same time work with `--shared-udp-ports`; tested with one real Mac
   plus a second process holding the ports (only one test Mac exists).
+- An animated lock screen (macOS aerial wallpaper) makes the Mac send about
+  44 Mbit/s at 1080p, which the bridge can't fully receive (about half is
+  dropped in the lab) and no outside connection could carry; nothing the
+  viewer can request lowers it (rate feedback, a smaller screen). Use a still
+  lock screen picture on managed Macs.
 - The viewer's status bar shows "frozen" whenever the Mac's screen is still
   (upstream behaviour): a still screen is not a fault.
 

@@ -642,6 +642,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         os.environ["ISS_VIDEO_CODEC"] = args.codec
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
+    # HPG fork: the UDP readers give up the GIL on every recvfrom and then
+    # wait up to the switch interval (5 ms by default) to get it back while
+    # another thread is busy, so a busy process drains only ~500 packets/s
+    # and the kernel drops the Mac's start-up burst (measured on Python 3.12:
+    # 488 pkt/s at 5 ms, 2,192 at 1 ms, 4,151 at 0.5 ms).
+    sys.setswitchinterval(float(os.environ.get("ISS_GIL_SWITCH_MS", "0.5")) / 1000.0)
+
     # Surface tracebacks for any thread that crashes — without this,
     # an unhandled exception in a worker (decoder, pump, RX loop,
     # asyncio task) prints nothing and the process can appear to die

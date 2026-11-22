@@ -211,6 +211,25 @@ class _CursorImage:
     rgba: bytes
 
 
+def _leading_keyframes(tile_nalus: dict) -> dict:
+    """HPG fork: per tile, the burst's NALUs up to and including its first
+    keyframe (all of its intra slices), without the inter frames after it."""
+    from .media.avc import _nal_is_keyframe
+    out = {}
+    for ti, nalus in tile_nalus.items():
+        kept, seen_key = [], False
+        for nalu in nalus:
+            nb = bytes(nalu)
+            if nb and (nb[0] & 0x1F) in (1, 5):
+                key = _nal_is_keyframe(nb)
+                if seen_key and not key:
+                    break
+                seen_key = seen_key or key
+            kept.append(nalu)
+        out[ti] = kept
+    return out
+
+
 @dataclass
 class SessionConfig:
     """Connection parameters. Defaults are conservative; the CLI
@@ -259,6 +278,14 @@ class SessionConfig:
     # "being observed" notice. No effect when the auth user is the console
     # user (no SessionSelect prompt) or with alt_session.
     share_without_asking: bool = False
+
+    # HPG fork: the frontend forwards Apple's H.264 to a browser and does not
+    # use iss's own decode (ISS_WT_LOCAL_DECODE off). Then only the burst's
+    # leading keyframe is decoded at connect (it sets the quality gate's
+    # state): decoding the whole burst in software took ~12 s on full-motion
+    # content (an animated lock screen) on a gateway without a GPU, while the
+    # Mac's stream went unprocessed.
+    video_passthrough: bool = False
 
     # Optional callback () -> "share_console" | "alt_session". Invoked during
     # negotiation when a different user is at the console and neither flag was
@@ -813,6 +840,25 @@ class Session:
         if rctl is not None:
             rctl.cap_kbps = None if kbps is None else max(1, int(kbps))
 
+    def video_socket_drops(self) -> "Optional[int]":
+        """HPG fork: packets the kernel dropped on THIS session's video socket
+        (its receive buffer was full), from /proc/net/udp. Unlike the
+        network-wide RcvbufErrors it doesn't include other sessions sharing
+        the host or container. None where unavailable."""
+        sock = self._sock_video
+        if sock is None or sys.platform != "linux":
+            return None
+        try:
+            inode = str(os.fstat(sock.fileno()).st_ino)
+            with open("/proc/net/udp") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) > 12 and parts[9] == inode:
+                        return int(parts[12])
+        except (OSError, ValueError):
+            return None
+        return None
+
     @property
     def rctl_bwe_kbps(self) -> int:
         """Bandwidth estimate last sent to the Mac (0: RCTL off or idle)."""
@@ -1169,6 +1215,13 @@ class Session:
         finally:
             punch_stop.set()
             punch_thr.join(timeout=1.0)
+        # HPG fork: start draining the media sockets NOW, before decoder set-up,
+        # burst decoding and audio/input set-up (seconds on a slow gateway CPU).
+        # Upstream only started the readers after all that, while the Mac was
+        # already streaming its start-up frames: the kernel buffer overflowed
+        # (6000+ video packets dropped per session on the office gateway),
+        # which broke frames and set off keyframe requests and resyncs.
+        self._start_drain_threads()
         self._ssrc_to_tile = dict(burst.ssrc_to_tile)
         self._pending_groups = burst.burst_pending
         self._group_arrival = {key: time.monotonic() for key in burst.burst_pending}
@@ -1279,7 +1332,10 @@ class Session:
         # find ref" transiently as the cold context catches up.
         self._last_decoder_restart_t = time.monotonic()
         self._dpb_error_window.clear()
-        self._decoder.feed_burst(burst.tile_nalus)
+        if cfg.video_passthrough and not _PASSTHROUGH_LOCAL_DECODE:
+            self._decoder.feed_burst(_leading_keyframes(burst.tile_nalus))
+        else:
+            self._decoder.feed_burst(burst.tile_nalus)
         # Install a libavcodec log callback that turns concealment
         # log messages into FIR requests. Idempotent — subsequent
         # connects keep the same callback hooked.
@@ -1646,6 +1702,7 @@ class Session:
             if t.is_alive() and t is not threading.current_thread():
                 t.join(timeout=2.0)
         self._threads = []
+        self._drains_started = False   # HPG fork: next connect starts them again
 
         if self._input is not None:
             self._input.close()
@@ -1728,15 +1785,33 @@ class Session:
 
     # ── thread spawning ──────────────────────────────────────────────
 
-    def _spawn_threads(self) -> None:
-        targets: list[tuple[str, Callable]] = [
-            ("iss-video-drain", self._video_drain_loop),
+    def _start_drain_threads(self) -> None:
+        """HPG fork: start only the two socket readers (recvfrom -> queue)."""
+        if getattr(self, "_drains_started", False):
+            return
+        self._stop_evt.clear()
+        for name, target in (("iss-video-drain", self._video_drain_loop),
+                             ("iss-ctrl-drain", self._ctrl_drain_loop)):
+            t = threading.Thread(target=target, name=name, daemon=True)
+            t.start()
+            self._threads.append(t)
+        self._drains_started = True
+
+    def _thread_targets(self) -> "list[tuple[str, Callable]]":
+        targets: list[tuple[str, Callable]] = []
+        if not getattr(self, "_drains_started", False):
+            targets += [("iss-video-drain", self._video_drain_loop),
+                        ("iss-ctrl-drain", self._ctrl_drain_loop)]
+        targets += [
             ("iss-video-process", self._video_process_loop),
-            ("iss-ctrl-drain", self._ctrl_drain_loop),
             ("iss-ctrl-process", self._ctrl_process_loop),
             ("iss-tcp-rx", self._tcp_rx_loop),
             ("iss-tx", self._tx_loop),
         ]
+        return targets
+
+    def _spawn_threads(self) -> None:
+        targets = self._thread_targets()
         if self._rctl_enabled:
             self._rctl = RateControl(pinned_bwe_kbps=self._rctl_pinned_bwe)
             targets.append(("iss-rctl", self._rctl_loop))

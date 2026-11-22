@@ -34,6 +34,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sys
 import threading
@@ -192,6 +193,33 @@ def clean_log_text(text: object, limit: int = 300) -> str:
     """Browser-supplied text going into our log: one line, bounded."""
     s = str(text)[:limit]
     return "".join(ch if ch.isprintable() else " " for ch in s)
+
+
+def thread_cpu_ticks() -> "dict[str, int]":
+    """CPU time (clock ticks) used so far by each live Python thread, keyed by
+    its thread name, from /proc/self/task. Empty where unavailable."""
+    out: "dict[str, int]" = {}
+    for t in threading.enumerate():
+        tid = getattr(t, "native_id", None)
+        if tid is None:
+            continue
+        try:
+            with open(f"/proc/self/task/{tid}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            ticks = int(fields[11]) + int(fields[12])   # utime + stime
+        except (OSError, ValueError, IndexError):
+            continue
+        out[t.name] = out.get(t.name, 0) + ticks
+    return out
+
+
+def describe_thread_cpu(before: "dict[str, int]", after: "dict[str, int]",
+                        seconds: float, top: int = 6) -> str:
+    """'name 45%, name 12%' for the busiest threads between two samples."""
+    hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    used = sorted(((after[n] - before.get(n, 0), n) for n in after), reverse=True)
+    parts = [f"{n} {d * 100 / hz / seconds:.0f}%" for d, n in used[:top] if d > 0]
+    return ", ".join(parts) or "idle"
 
 
 def read_udp_rcvbuf_errors(path: str = "/proc/net/snmp") -> "Optional[int]":

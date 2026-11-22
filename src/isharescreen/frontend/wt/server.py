@@ -31,6 +31,7 @@ viewer lock (late joiners deadlocked the event loop).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -62,7 +63,7 @@ from .audio import OpusEncoder
 from .capsule import CapsuleType, H3Capsule, H3CapsuleDecoder
 from .cert import write_cert, trust_cert_in_keychain, is_cert_trusted
 from .hpg import (AdmissionError, EventSink, TokenVerifier, clean_log_text,
-                  read_udp_rcvbuf_errors)
+                  describe_thread_cpu, read_udp_rcvbuf_errors, thread_cpu_ticks)
 
 
 log = logging.getLogger(__name__)
@@ -773,7 +774,9 @@ class WebTransportBridge:
         exit_after_session: bool = False,
         source_url: str = "",
     ) -> None:
-        self._config = config
+        # HPG fork: this frontend forwards the Mac's H.264 to the browsers and
+        # never uses iss's own decode, so the session skips decoding the burst.
+        self._config = dataclasses.replace(config, video_passthrough=True)
         self._port = port
         # HPG fork: listen only where told (upstream: every interface).
         self._bind = bind
@@ -796,6 +799,7 @@ class WebTransportBridge:
         self._exit_code = 0
         self._session_attempts = 0
         self._mac_connected_t = 0.0
+        self._video_drops_last = 0
         # Opt-in: install our self-signed cert into the macOS login
         # keychain so Safari (which ignores serverCertificateHashes) can
         # do WebTransport. Set True once trusted — the page then connects
@@ -914,22 +918,44 @@ class WebTransportBridge:
         # (authenticated) input stream, replacing the open GET /stats.
         rcvbuf_base = read_udp_rcvbuf_errors()
         rcvbuf_last = [rcvbuf_base]
+        cpu_last = [thread_cpu_ticks(), time.monotonic()]
 
         async def _stats_push():
             while True:
                 await asyncio.sleep(1.0)
                 stats = self._server_stats()
+                # HPG fork: where the CPU goes, every 10 s while a session runs.
+                now_c = time.monotonic()
+                if now_c - cpu_last[1] >= 10.0:
+                    cur_c = thread_cpu_ticks()
+                    if self._session is not None:
+                        log.info("cpu by thread (last %.0f s): %s", now_c - cpu_last[1],
+                                 describe_thread_cpu(cpu_last[0], cur_c, now_c - cpu_last[1]))
+                    cpu_last[0], cpu_last[1] = cur_c, now_c
                 # HPG fork: kernel drops of Mac→bridge media because a socket
                 # receive buffer was full (invisible to RTP loss counting).
-                cur = read_udp_rcvbuf_errors()
-                if cur is not None and rcvbuf_base is not None:
-                    if rcvbuf_last[0] is not None and cur > rcvbuf_last[0]:
-                        log.warning("UDP receive buffer overflow: %d datagrams "
-                                    "dropped by the kernel in the last second "
-                                    "(raise net.core.rmem_max on the host)",
-                                    cur - rcvbuf_last[0])
-                    rcvbuf_last[0] = cur
-                    stats["rcvbuf_errors"] = cur - rcvbuf_base
+                # Count THIS session's video socket (the network-wide
+                # counter also includes other sessions in the same host or
+                # container); fall back to the network-wide one.
+                sess = self._session
+                vd = sess.video_socket_drops() if sess is not None else None
+                if vd is not None:
+                    if vd > self._video_drops_last:
+                        log.warning("video socket overflow: %d packets dropped by "
+                                    "the kernel in the last second (session total "
+                                    "%d)", vd - self._video_drops_last, vd)
+                    self._video_drops_last = vd
+                    stats["rcvbuf_errors"] = vd
+                else:
+                    cur = read_udp_rcvbuf_errors()
+                    if cur is not None and rcvbuf_base is not None:
+                        if rcvbuf_last[0] is not None and cur > rcvbuf_last[0]:
+                            log.warning("UDP receive buffer overflow: %d datagrams "
+                                        "dropped by the kernel in the last second "
+                                        "(raise net.core.rmem_max on the host)",
+                                        cur - rcvbuf_last[0])
+                        rcvbuf_last[0] = cur
+                        stats["rcvbuf_errors"] = cur - rcvbuf_base
                 with self._viewers_lock:
                     targets = list(self.viewers)
                 # HPG fork: tell the Mac what the slowest viewer can take.
@@ -1596,6 +1622,14 @@ class WebTransportBridge:
 
     def _teardown_session(self) -> None:
         had_session = self._session is not None
+        # HPG fork: this session's kernel drops on its video socket, read
+        # before the socket closes (for the log and the launcher's event).
+        video_drops = None
+        if had_session:
+            try:
+                video_drops = self._session.video_socket_drops()
+            except Exception:
+                video_drops = None
         pump_stop = getattr(self, "_pump_stop", None)
         if pump_stop is not None:
             pump_stop.set()
@@ -1620,9 +1654,10 @@ class WebTransportBridge:
             self._session.close()
             self._session = None
         self._session_starting = False
+        self._video_drops_last = 0
         if had_session:
-            self._events.emit("mac_disconnected")
-        log.info("iss session torn down")
+            self._events.emit("mac_disconnected", video_drops=video_drops)
+        log.info("iss session torn down (video socket drops: %s)", video_drops)
 
     # -- input handling -----------------------------------------------
 
