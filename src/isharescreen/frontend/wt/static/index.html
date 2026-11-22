@@ -104,6 +104,16 @@
     background: rgba(220,160,20,.25); color: #ffd98a; white-space: nowrap;
   }
   #src-link { flex: 0 0 auto; color: #9cc8ff; text-decoration: none; white-space: nowrap; }
+  /* HPG fork: key bar (latching modifiers + keys a browser can't send). */
+  #keybar { flex: 0 0 auto; display: flex; gap: 3px; align-items: center; }
+  #keybar button, #keybar select {
+    background: rgba(255,255,255,.08); color: #fff;
+    border: 1px solid rgba(255,255,255,.18); border-radius: 4px;
+    height: 26px; min-width: 26px; padding: 0 5px; font: inherit; cursor: pointer;
+  }
+  #keybar button:hover:not(:disabled) { background: rgba(20,120,220,.85); }
+  #keybar button.latched { background: rgba(220,160,20,.9); color: #000; border-color: #ffd98a; }
+  #keybar button:disabled, #keybar select:disabled { opacity: .35; cursor: default; }
   #src-link:hover { text-decoration: underline; }
 </style>
 </head>
@@ -111,6 +121,31 @@
 <div id="stage"><canvas id="screen" width="1280" height="800"></canvas></div>
 <div id="topbar">
   <span id="status">connecting…</span>
+  <span id="keybar" role="toolbar" aria-label="Keys for the Mac">
+    <button type="button" data-mod="cmd" aria-pressed="false" disabled
+            title="Command: stays held for your next key or click (click again to release)">⌘</button>
+    <button type="button" data-mod="opt" aria-pressed="false" disabled
+            title="Option: stays held for your next key or click (click again to release)">⌥</button>
+    <button type="button" data-mod="ctrl" aria-pressed="false" disabled
+            title="Control: stays held for your next key or click (click again to release)">⌃</button>
+    <button type="button" data-mod="shift" aria-pressed="false" disabled
+            title="Shift: stays held for your next key or click (click again to release)">⇧</button>
+    <button type="button" data-key="caps" disabled title="Caps Lock">⇪</button>
+    <button type="button" data-key="esc" disabled title="Escape">esc</button>
+    <button type="button" data-key="tab" disabled title="Tab">⇥</button>
+    <button type="button" data-key="return" disabled title="Return">⏎</button>
+    <button type="button" data-key="left" disabled title="Left arrow">←</button>
+    <button type="button" data-key="up" disabled title="Up arrow">↑</button>
+    <button type="button" data-key="down" disabled title="Down arrow">↓</button>
+    <button type="button" data-key="right" disabled title="Right arrow">→</button>
+    <select id="fkeys" disabled title="Function keys">
+      <option value="">F…</option>
+      <option value="f1">F1</option><option value="f2">F2</option><option value="f3">F3</option>
+      <option value="f4">F4</option><option value="f5">F5</option><option value="f6">F6</option>
+      <option value="f7">F7</option><option value="f8">F8</option><option value="f9">F9</option>
+      <option value="f10">F10</option><option value="f11">F11</option><option value="f12">F12</option>
+    </select>
+  </span>
   <select id="res" title="Source resolution (lower = less CPU on the host's encoder)">
     <option value="0x0">Auto</option>
     <option value="7680x4320">7680 × 4320 (8K UHD)</option>
@@ -854,6 +889,7 @@ async function main() {
         else if (m.type === "auth_ok") {
           readOnly = !!m.read_only;
           document.getElementById("ro-badge").style.display = readOnly ? "" : "none";
+          setKeybarEnabled(!readOnly);
           setSourceUrl(m.source_url);
         } else if (m.type === "auth_failed") {
           setStatus(`not allowed: ${m.reason || "refused"}`, "err");
@@ -877,6 +913,54 @@ async function main() {
     if (readOnly && obj.type !== "stats" && obj.type !== "keyframe" && obj.type !== "log") return;
     try { await inputWriter.write(enc.encode(JSON.stringify(obj) + "\n")); }
     catch (e) { /* writer closed during teardown */ }
+  }
+
+  // --- HPG fork: key bar ------------------------------------------------
+  const keybar = document.getElementById("keybar");
+  const fkeys = document.getElementById("fkeys");
+  const latch = makeKeyLatch(
+    (ks, down) => send({type: "key", down, keysym: ks}),
+    (held) => {
+      for (const b of keybar.querySelectorAll("button[data-mod]")) {
+        const on = held.includes(KEYBAR_KEYSYM[b.dataset.mod]);
+        b.classList.toggle("latched", on);
+        b.setAttribute("aria-pressed", on ? "true" : "false");
+      }
+    });
+  function setKeybarEnabled(on) {
+    for (const el of keybar.querySelectorAll("button, select")) el.disabled = !on;
+    if (!on) latch.clear();
+  }
+  // A click on the bar must never take the keyboard away from the screen.
+  keybar.addEventListener("mousedown", (e) => { if (e.target !== fkeys) e.preventDefault(); });
+  keybar.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b || b.disabled || readOnly) return;
+    if (b.dataset.mod) latch.toggle(KEYBAR_KEYSYM[b.dataset.mod]);
+    else if (b.dataset.key) latch.tap(KEYBAR_KEYSYM[b.dataset.key]);
+  });
+  fkeys.addEventListener("change", () => {
+    const k = fkeys.value;
+    fkeys.value = "";
+    fkeys.blur();
+    if (k && !readOnly) latch.tap(KEYBAR_KEYSYM[k]);
+  });
+  wt.closed.then(() => latch.clear(), () => latch.clear());
+  // Optional: the embedding page may drive the same latch (same parent and
+  // origin check as iss-config). keys: names from KEYBAR_KEYSYM.
+  if (params.get("embed") === "1" && params.get("parent")) {
+    const parentOrigin = params.get("parent");
+    window.addEventListener("message", (ev) => {
+      if (ev.source !== window.parent || ev.origin !== parentOrigin) return;
+      const d = ev.data || {};
+      if (d.type !== "iss-keys" || readOnly) return;
+      const ks = (Array.isArray(d.keys) ? d.keys : [])
+        .map((n) => KEYBAR_KEYSYM[String(n)]).filter((v) => v !== undefined);
+      if (d.action === "clear") latch.clear();
+      else if (d.action === "toggle") ks.forEach((k) => latch.toggle(k));
+      else if (d.action === "tap" && ks.length) latch.tap(ks[0]);
+      else if (d.action === "combo" && ks.length) latch.combo(ks);
+    });
   }
 
   // Dynamic resolution ("Auto" in the connect form): report the stage's pixel
@@ -996,6 +1080,7 @@ async function main() {
     if (!xy) return;
     buttonMask &= ~buttonBit(e.button);
     send({type: "mouse", buttons: buttonMask, x: xy[0], y: xy[1]});
+    latch.mouseUp();
   });
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   // Wheel: convert pixel-mode `deltaY` to integer ticks for the host's
@@ -1049,12 +1134,18 @@ async function main() {
     if (e.metaKey && e.key === "w") return;  // let the user close the tab
     e.preventDefault();
     const ks = keysymFromEvent(e);
-    if (ks) send({type: "key", down: true, keysym: ks});
+    if (ks) {
+      send({type: "key", down: true, keysym: ks});
+      latch.realKeyDown(ks);
+    }
   });
   document.addEventListener("keyup", (e) => {
     e.preventDefault();
     const ks = keysymFromEvent(e);
-    if (ks) send({type: "key", down: false, keysym: ks});
+    if (ks) {
+      send({type: "key", down: false, keysym: ks});
+      latch.realKeyUp(ks);
+    }
   });
 
   // --- video stream reader --------------------------------------------
@@ -1483,6 +1574,83 @@ function readBE64(buf, off) {
 
 // Minimal JS keycode → X11 keysym map. Covers letters, digits,
 // arrows, Enter/Tab/Esc/Backspace, modifiers. Add as needed.
+// KEYLATCH-BEGIN (HPG fork; same behaviour as HPG's standard viewer key bar)
+// Keysyms as Apple's Screen Sharing reads them (measured, macOS 27).
+const KEYBAR_KEYSYM = {
+  cmd: 0xffeb, opt: 0xffe7, ctrl: 0xffe3, shift: 0xffe1,
+  caps: 0xffe5, esc: 0xff1b, tab: 0xff09, return: 0xff0d,
+  left: 0xff51, up: 0xff52, right: 0xff53, down: 0xff54,
+};
+for (let i = 1; i <= 12; i++) KEYBAR_KEYSYM["f" + i] = 0xffbe + i - 1;
+
+// Modifier and lock keys never count as "the next key" (left or right).
+function isModifierKeysym(ks) {
+  return (ks >= 0xffe1 && ks <= 0xffee) || ks === 0xfe03 || ks === 0xff7f || ks === 0xff14;
+}
+
+// sendKey(keysym, down) sends one key event to the Mac; onChange(latched)
+// reports the currently latched modifiers (for the buttons' lit state).
+function makeKeyLatch(sendKey, onChange) {
+  let latched = [];
+  let nextKey = null;
+  const changed = () => { if (onChange) onChange(latched.slice()); };
+  function releaseAll() {
+    for (let i = latched.length - 1; i >= 0; i--) sendKey(latched[i], false);
+    latched = [];
+    nextKey = null;
+    changed();
+  }
+  return {
+    latched: () => latched.slice(),
+    // A modifier that isn't latched is pressed and stays pressed; clicking a
+    // latched one releases it and sends nothing else.
+    toggle(ks) {
+      const i = latched.indexOf(ks);
+      if (i >= 0) {
+        latched.splice(i, 1);
+        sendKey(ks, false);
+        if (!latched.length) nextKey = null;
+      } else {
+        latched.push(ks);
+        sendKey(ks, true);
+      }
+      changed();
+    },
+    // Keys from the person's own keyboard (already sent by the caller): the
+    // first non-modifier key pressed while something is latched becomes the
+    // next key; when it goes up, every latched modifier is released.
+    realKeyDown(ks) {
+      if (latched.length && nextKey === null && !isModifierKeysym(ks)) nextKey = ks;
+    },
+    realKeyUp(ks) {
+      if (nextKey !== null && ks === nextKey) releaseAll();
+    },
+    // A key from the bar: down, up, then release every latched modifier.
+    tap(ks) {
+      sendKey(ks, true);
+      sendKey(ks, false);
+      if (latched.length) releaseAll();
+    },
+    // Release the latched modifiers, then all keys down in order, up in reverse.
+    combo(keys) {
+      if (latched.length) releaseAll();
+      for (const k of keys) sendKey(k, true);
+      for (let i = keys.length - 1; i >= 0; i--) sendKey(keys[i], false);
+    },
+    // A latched modifier also applies to the next mouse click (Option-click).
+    mouseUp() {
+      if (latched.length) releaseAll();
+    },
+    // Forget without sending (connection lost).
+    clear() {
+      latched = [];
+      nextKey = null;
+      changed();
+    },
+  };
+}
+// KEYLATCH-END
+
 function keysymFromEvent(e) {
   const k = e.key;
   if (k.length === 1) return k.charCodeAt(0);
