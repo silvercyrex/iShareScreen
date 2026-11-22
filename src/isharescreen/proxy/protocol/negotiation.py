@@ -294,6 +294,12 @@ _SS_MAGIC = b"\x00\x4a\x00\x01"
 # or, in the cmd=0 share-console path, the human click on the
 # GuestAccessAskUser popup.
 _SS_POPUP_TIMEOUT_S = 60.0
+# HPG fork: on the cmd=2 (own session) path the daemon answers only after it
+# has logged the user in when that user has no session yet (measured 4.3-4.9 s
+# on macOS 27.2.1), but at once when the user's session already exists
+# (1-4 ms). Below this delay we treat the session as existing — see
+# connect_and_negotiate for why that matters.
+_SS_EXISTING_SESSION_ACK_S = 1.0
 
 
 def _build_ss_cmd0_body(console_user: str, *, cmd: int = 0) -> bytes:
@@ -431,10 +437,11 @@ def _phase_session_select(
     password: str,
     ecb_key: bytes,
     ss_wait: float = _SS_POPUP_TIMEOUT_S,
-) -> bool:
-    """Detect + handle the SessionSelect prompt. Returns True if a prompt
-    was processed, False if the server didn't emit one (caller continues
-    with the normal handshake).
+) -> Optional[float]:
+    """Detect + handle the SessionSelect prompt. Returns the seconds the
+    server took to acknowledge our command if a prompt was processed (HPG
+    fork; upstream returned True), or None if the server didn't emit one
+    (caller continues with the normal handshake).
 
     For `mode="share_console"` (cmd=0): fires the popup at the console
     user, blocks until they click Allow.
@@ -458,7 +465,7 @@ def _phase_session_select(
             "session-select state (auth user matches console, or "
             "VNCSelectSession off)"
         )
-        return False
+        return None
     flags, console_user = prompt
     log.info(
         "session-select: prompt — flags=0x%x console_user=%r mode=%s",
@@ -493,6 +500,7 @@ def _phase_session_select(
     )
 
     sock.settimeout(ss_wait)
+    t_sent = time.monotonic()
     try:
         ack = sock.recv(65536)
     except socket.timeout:
@@ -509,10 +517,10 @@ def _phase_session_select(
             "denied or daemon rejected the cmd"
         )
     log.info(
-        "session-select: ack received (%dB) — proceeding with normal "
-        "post-toggle handshake", len(ack),
+        "session-select: ack received (%dB, %.3fs) — proceeding with normal "
+        "post-toggle handshake", len(ack), time.monotonic() - t_sent,
     )
-    return True
+    return time.monotonic() - t_sent
 
 
 # ── phase 3: pre-toggle plaintext + enc1103 setup ─────────────────────
@@ -744,6 +752,7 @@ def connect_and_negotiate(
     # logged in. Peek non-destructively — if absent, the bytes stay buffered
     # for the normal handshake below; if present, route by flag (default
     # share-console = view their session; --alt-session = log in separately).
+    existing_session = False
     if _peek_ss_prompt(sock):
         # Neither mode was forced and the launcher gave us a way to ask the
         # user (a different user is logged in at the host's console): prompt
@@ -788,13 +797,37 @@ def connect_and_negotiate(
             mode = "share_console_no_ask"
         else:
             mode = "share_console"
-        _phase_session_select(
+        ack_delay = _phase_session_select(
             sock,
             mode=mode,
             username=username, password=password, ecb_key=ecb_key,
         )
+        if alt_session and ack_delay is not None:
+            existing_session = ack_delay < _SS_EXISTING_SESSION_ACK_S
 
-    if alt_session:
+    if alt_session and existing_session:
+        # HPG fork: reconnecting to the user's EXISTING session. Sending the
+        # alt-user-login SetDisplayConfiguration here (as on a first login)
+        # left the session with no picture until the user was logged out on
+        # the Mac: the agent started capture before the new virtual display
+        # existed and never retried (replayd: "Rejecting current process
+        # shareable content filter"). Without it the daemon reattaches the
+        # existing session and streams it. Verified on macOS 27.2.1:
+        # first login + repeated reconnects all stream.
+        log.info("alt-session: user's session already exists — reconnecting "
+                 "without the alt-user-login display configuration")
+        sock.sendall(
+            build_viewer_info(
+                app_id=2, app_ver=(6, 1, 0),
+                os_ver=APPLE_VIEWER_OS_VER,
+                command_mask=APPLE_VIEWER_COMMAND_MASK,
+                extra=b"",
+            )
+            + APPLE_0X12_FOLLOWUP
+        )
+        time.sleep(_POST_VIEWERINFO_SETTLE_S)
+        sock.sendall(build_set_encodings(HP_ENCODINGS_FULL))
+    elif alt_session:
         # cmd=2 path: send a SetDisplayConfiguration with the alt-user
         # login hint set (the 0x07 byte at displayInfo+0x99 — captured
         # from Apple Screen Sharing.app traffic). Without that hint the

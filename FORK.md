@@ -45,6 +45,14 @@ helping a person in their own session, and IT working in a separate session.
 - The TLS key is written readable by its owner only.
 - Fixed a deadlock when a viewer joined a session that was already running.
 
+**Separate session (`--alt-session`)**
+- Reconnecting to a user's existing session works. Upstream sent the
+  "new login" display setup on every connection; on a reconnect that left the
+  session with no picture until the user was logged out on the Mac. The Mac
+  answers the session choice only after logging a new user in (about 4-5 s)
+  but at once when the session exists (a few ms), so iss now skips that
+  setup when the answer is quick.
+
 **Viewer page**
 - Can be embedded in HPG's HTTPS page: settings arrive by `postMessage` from
   the parent origin named in `?parent=`, so the ticket never sits in a URL.
@@ -62,14 +70,12 @@ date. `src/isharescreen/frontend/wt/hpg.py` is new.
 
 ## Known issues
 
-- Separate-session reconnect (`--alt-session`): on macOS 27, only the first
-  connection after that user logs in gets a picture; reconnecting gets none
-  until the user is logged out on the Mac. Apple's own Screen Sharing app
-  reconnects fine, so the cause is in this client; under investigation.
 - The SRP server proof (M2) is still not checked; none of HPG's test Macs
   offer SRP, so a check could not be tested.
 - One bridge process per Mac session per address: the client always uses
   local UDP ports 5900/5901.
+- The viewer's status bar shows "frozen" whenever the Mac's screen is still
+  (upstream behaviour): a still screen is not a fault.
 
 ## Running it for a launcher (example)
 

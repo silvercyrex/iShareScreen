@@ -47,7 +47,7 @@ def test_no_ask_sends_cmd1_when_offered(monkeypatch):
     assert neg._phase_session_select(
         sock, mode="share_console_no_ask",
         username="u", password="p", ecb_key=b"\x00" * 16,
-    )
+    ) is not None
     (length,) = struct.unpack(">H", sock.sent[:2])
     assert length == 72
     assert sock.sent[2 + 6] == 1
@@ -107,3 +107,21 @@ def test_nonsrp_only_when_asked(monkeypatch):
     monkeypatch.setattr(neg, "do_srp_auth", srp_must_not_run)
     _sock, key = neg._phase_auth("mac", 5900, "u", "p", "nonsrp")
     assert key == b"k" * 16
+
+
+def test_ack_delay_tells_existing_session(monkeypatch):
+    # A quick ack on the own-session path means the user's session exists
+    # (the daemon answers a first login only after logging the user in).
+    monkeypatch.setattr(neg, "_read_ss_prompt", lambda s: (0x7, "Admin"))
+    delay = neg._phase_session_select(
+        _FakeSock(), mode="alt_session",
+        username="rstest", password="p", ecb_key=b"\x00" * 16,
+    )
+    assert delay is not None and delay < neg._SS_EXISTING_SESSION_ACK_S
+
+
+def test_no_prompt_returns_none(monkeypatch):
+    monkeypatch.setattr(neg, "_read_ss_prompt", lambda s: None)
+    assert neg._phase_session_select(
+        _FakeSock(), mode="alt_session",
+        username="u", password="p", ecb_key=b"\x00" * 16) is None
