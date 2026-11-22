@@ -39,3 +39,12 @@ def test_stats_report_raw_dy_and_the_bridge_logs_only_a_number():
     assert "raw_dy: rawDy" in PAGE
     assert _int_or_dash(54) == "54" and _int_or_dash("x<script>") == "-"
     assert _int_or_dash(None) == "-"
+
+
+def test_pixel_check_reads_a_copy_not_the_video_canvas():
+    m = re.search(r"if \(probeCtx\) \{(.*?)\n        \}", PAGE, re.S)
+    assert m, "probe path"
+    body = m.group(1)
+    assert "probeCtx.drawImage(canvas," in body and ", 1, 1, gx, gy, 1, 1)" in body
+    assert "probeCtx.getImageData(0, 0, 8, 8)" in body
+    assert "ctx.getImageData" not in body.replace("probeCtx.getImageData", "")

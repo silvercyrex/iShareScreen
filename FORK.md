@@ -121,6 +121,12 @@ helping a person in their own session, and IT working in a separate session.
   on Y by ~50 px, so a dragged window jumped up and down. The raw event is
   still measured: the browser log line's `raw_dy` is the largest Y gap
   between the two in the last second (Mac pixels).
+- The page's once-a-second pixel check (brightness / gray in the browser
+  log line) copies its 64 sample pixels to a small canvas on the GPU and
+  reads that once, instead of 64 reads of the video canvas: 2.2 ms instead
+  of 10.3 ms of the page's main thread per check on a moving screen (test
+  Mac), same values, and the video canvas is never read back (Chrome may
+  move a canvas that is read back often off the GPU).
 - Every 10 s the log has "frame timing": time from a frame's first packet
   to its hand-off to the viewers, and from there into the QUIC stream.
 

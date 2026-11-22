@@ -1099,6 +1099,10 @@ async function main() {
   }
   requestAnimationFrame(flushMove);
 
+  // HPG fork: 8x8 GPU canvas for the once-a-second pixel check (below).
+  const probeCtx = (typeof OffscreenCanvas !== "undefined")
+    ? new OffscreenCanvas(8, 8).getContext("2d") : null;
+
   // HPG fork: positions come from mousemove only. Sending pointerrawupdate
   // positions as well made a dragged window jump up and down in the viewer
   // embedded in the status page on Windows (the two events disagreed on Y
@@ -1259,12 +1263,30 @@ async function main() {
     let sm = 0, ssq = 0, sg = 0, n = 0;
     if (canvas.width > 0 && canvas.height > 0) {
       try {
+        // HPG fork: one readback instead of 64, and never of the video
+        // canvas itself. Each getImageData on the video canvas waited for its
+        // own GPU copy (~10 ms of the main thread per check on an M2 with a
+        // moving screen), and Chrome may move a canvas that is read back often
+        // off the GPU. Copy the same 64 pixels into an 8x8 canvas on the GPU,
+        // then read that once.
+        let grid = null;
+        if (probeCtx) {
+          for (let gy = 0; gy < 8; gy++) {
+            for (let gx = 0; gx < 8; gx++) {
+              probeCtx.drawImage(canvas,
+                Math.floor((gx + 0.5) * canvas.width / 8),
+                Math.floor((gy + 0.5) * canvas.height / 8), 1, 1, gx, gy, 1, 1);
+            }
+          }
+          grid = probeCtx.getImageData(0, 0, 8, 8).data;
+        }
         for (let gy = 0; gy < 8; gy++) {
           for (let gx = 0; gx < 8; gx++) {
-            const px = ctx.getImageData(
-              Math.floor((gx + 0.5) * canvas.width / 8),
-              Math.floor((gy + 0.5) * canvas.height / 8),
-              1, 1).data;
+            const px = grid ? grid.subarray((gy * 8 + gx) * 4, (gy * 8 + gx) * 4 + 4)
+              : ctx.getImageData(
+                Math.floor((gx + 0.5) * canvas.width / 8),
+                Math.floor((gy + 0.5) * canvas.height / 8),
+                1, 1).data;
             const lum = 0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2];
             sm += lum; ssq += lum * lum; n++;
             // "gray" = near-mid + desaturated (concealment fill).
