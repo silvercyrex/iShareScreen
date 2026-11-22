@@ -25,6 +25,10 @@ viewer->server video SRTCP key, the same context as RRs and LTR acks):
 Opt-in: ISS_RCTL=1 turns it on (Session); ISS_RCTL_BWE=<kbps> pins the
 estimate instead of the adaptive one below.
 
+HPG fork: `RateControl.cap_kbps` is a live ceiling on the estimate. The
+browser bridge sets it from its viewers' own paths, so the Mac encodes what
+the slowest viewer's connection can carry (only with ISS_RCTL=1).
+
 This module is transport-agnostic: `RateControl.note_packet` is fed from
 the video receive path, `RateControl.tick` returns the next packet body
 (unprotected), and the session sends it. The estimator is a small
@@ -268,6 +272,8 @@ class RateControl:
         self._last_rtp: Optional[tuple[int, float]] = None
         self._bytes = 0
         self._seq: dict[int, _SeqCounter] = {}
+        # HPG fork: ceiling set from outside (the bridge's viewer paths).
+        self.cap_kbps: Optional[int] = None
 
     def note_packet(self, ssrc: int, seq: int, rtp_ts: int, nbytes: int, now: float) -> None:
         with self._lock:
@@ -298,6 +304,9 @@ class RateControl:
         self.last_backlog = backlog
         if self.pinned_bwe_kbps is not None:
             bwe = self.pinned_bwe_kbps
+        cap = self.cap_kbps
+        if cap is not None:
+            bwe = min(bwe, cap)
         loss = self.estimator.loss_fraction or 0.0
         self.last_bwe = bwe
         self.last_loss_pct = min(100, int(round(loss * 100)))
@@ -320,7 +329,7 @@ class RateControl:
         rx = e.receive_kbps
         mode = "pinned" if self.pinned_bwe_kbps is not None else "adaptive"
         return (
-            f"rctl bwe={self.last_bwe} ({mode}; est={e.bwe_kbps}) "
+            f"rctl bwe={self.last_bwe} ({mode}; est={e.bwe_kbps}; cap={self.cap_kbps}) "
             f"loss%={'-' if loss is None else f'{loss * 100:.1f}'} "
             f"rx_kbps={'-' if rx is None else f'{rx:.0f}'} state={e.state} "
             f"backlog={self.last_backlog} decreases={e.decreases} sent={self.sent}"

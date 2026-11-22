@@ -806,6 +806,19 @@ class Session:
             gate.mark_decode_error(tile_idx)
             self._send_fir_for_tile(tile_idx)
 
+    def set_rctl_cap(self, kbps: Optional[int]) -> None:
+        """HPG fork: ceiling for the RCTL bandwidth estimate sent to the Mac
+        (None = no ceiling). No effect unless RCTL is on (ISS_RCTL=1)."""
+        rctl = getattr(self, "_rctl", None)
+        if rctl is not None:
+            rctl.cap_kbps = None if kbps is None else max(1, int(kbps))
+
+    @property
+    def rctl_bwe_kbps(self) -> int:
+        """Bandwidth estimate last sent to the Mac (0: RCTL off or idle)."""
+        rctl = getattr(self, "_rctl", None)
+        return rctl.last_bwe if rctl is not None else 0
+
     def note_browser_healthy(self) -> None:
         """Browser-frontend heartbeat: called ONLY when the browser's own
         WebCodecs decoder reports it is actively decoding a good picture (the

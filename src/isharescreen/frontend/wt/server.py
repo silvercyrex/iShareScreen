@@ -182,6 +182,12 @@ _RESUME_BEHIND_S = float(os.environ.get("ISS_WT_RESUME_BEHIND_MS", "150")) / 100
 _KEYFRAME_RETRY_S = float(os.environ.get("ISS_WT_KEYFRAME_RETRY_MS", "1500")) / 1000.0
 # HPG fork: QUIC congestion control towards the browser.
 _WT_CONGESTION = os.environ.get("ISS_WT_CONGESTION", "reno")
+# HPG fork: with ISS_RCTL=1 the Mac's encoder is told (RCTL) to stay at this
+# share of the slowest viewer's path rate, so a slow connection gets a smaller
+# picture stream instead of dropped frames. Bounds in kbit/s.
+_RCTL_PATH_SHARE = float(os.environ.get("ISS_WT_RCTL_SHARE", "0.8"))
+_RCTL_MIN_KBPS = int(os.environ.get("ISS_WT_RCTL_MIN_KBPS", "800"))
+_RCTL_MAX_KBPS = 65535
 # Profiling: log iss-side forward gaps (>80ms between AUs) to localize stutter.
 _PROFILE = os.environ.get("ISS_WT_PROFILE", "0") == "1"
 
@@ -309,6 +315,18 @@ class _ViewerSession:
             rtt = max(getattr(loss, "_rtt_smoothed", 0.0) or 0.0, 0.005)
             cwnd = max(loss.congestion_window, 1)
             return backlog / (cwnd / rtt)
+        except Exception:
+            return 0.0
+
+    def path_kbps(self) -> float:
+        """What this viewer's connection currently carries: QUIC congestion
+        window / smoothed RTT, in kbit/s. 0 when not known yet."""
+        try:
+            loss = self.h3._quic._loss
+            rtt = getattr(loss, "_rtt_smoothed", 0.0) or 0.0
+            if rtt <= 0:
+                return 0.0
+            return loss.congestion_window * 8 / rtt / 1000.0
         except Exception:
             return 0.0
 
@@ -914,6 +932,10 @@ class WebTransportBridge:
                     stats["rcvbuf_errors"] = cur - rcvbuf_base
                 with self._viewers_lock:
                     targets = list(self.viewers)
+                # HPG fork: tell the Mac what the slowest viewer can take.
+                self._update_rctl_cap(targets)
+                stats["bwe_kbps"] = getattr(self._session, "rctl_bwe_kbps", 0) \
+                    if self._session is not None else 0
                 for v in targets:
                     # Keep resyncs moving on a still screen (no frames arrive
                     # to drive them), and give each viewer its own counts.
@@ -923,6 +945,7 @@ class WebTransportBridge:
                         "frames_dropped": v.frames_dropped,
                         "resyncs": v.resyncs,
                         "resyncing": bool(v.resync_since),
+                        "path_kbps": round(v.path_kbps()),
                         "behind_ms": round(min(v.behind_s(), 60.0) * 1000),
                     })
         asyncio.create_task(_stats_push())
@@ -1132,6 +1155,35 @@ class WebTransportBridge:
         self._pending.clear()
         self._teardown_session()
         self._events.emit("ended", reason=reason, exit_code=exit_code)
+
+    def _update_rctl_cap(self, viewers) -> None:
+        """Smoothed ceiling = _RCTL_PATH_SHARE x the slowest viewer's path
+        rate. Falls quickly when a path slows, rises slowly when it recovers
+        (a congestion window that just grew can shrink again on the next
+        loss). Kept while no viewer is connected (linger)."""
+        session = self._session
+        if session is None:
+            return
+        rates = [r for r in (v.path_kbps() for v in viewers) if r > 0]
+        if not rates:
+            return
+        target = min(rates) * _RCTL_PATH_SHARE
+        prev = getattr(self, "_rctl_cap_smooth", None)
+        if prev is None:
+            cap = target
+        elif target < prev:
+            cap = prev + 0.5 * (target - prev)
+        else:
+            cap = prev + 0.1 * (target - prev)
+        self._rctl_cap_smooth = cap
+        cap_i = int(min(_RCTL_MAX_KBPS, max(_RCTL_MIN_KBPS, cap)))
+        session.set_rctl_cap(cap_i)
+        now = time.monotonic()
+        if now - getattr(self, "_rctl_log_t", 0.0) > 10.0:
+            self._rctl_log_t = now
+            log.info("rate control: slowest viewer path %.0f kbit/s -> asking the "
+                     "Mac for at most %d kbit/s (sent %d)", min(rates), cap_i,
+                     getattr(session, "rctl_bwe_kbps", 0))
 
     def _server_stats(self) -> dict:
         sess = self._session

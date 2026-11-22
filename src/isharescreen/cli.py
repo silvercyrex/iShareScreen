@@ -581,6 +581,9 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
     # structure of the 4-tile stream (drift/"fleas"); one stream decodes
     # cleanly with one decoder, no compositing.
     os.environ.setdefault("ISS_TILES_PER_FRAME", "1")
+    # HPG fork: with ISS_RCTL=1 the bridge sends Apple's RCTL rate feedback
+    # capped at what its viewers' connections carry. Off by default until its
+    # effect on the Mac's H.264 encoder is measured.
     from isharescreen.frontend.wt.server import run as run_browser
     from isharescreen.frontend.wt.hpg import EventSink, TicketVerifier, TokenVerifier
     if args.ticket_key_file:
