@@ -155,7 +155,13 @@ def _make_parser() -> argparse.ArgumentParser:
     )
     g.add_argument(
         "--view-only", action="store_true",
-        help="every viewer is view-only (no mouse, keyboard or resize)",
+        help="watch only: no mouse, keyboard, scroll or clipboard reaches the "
+        "Mac (browser: every viewer is view-only; desktop: the window too)",
+    )
+    g.add_argument(
+        "--ask-password", action="store_true",
+        help="desktop viewer: ask for the Mac password in a small window, "
+        "connect from there (3 tries), then open the video window",
     )
     g.add_argument(
         "--linger", type=float, default=15.0, metavar="SECS",
@@ -460,7 +466,8 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     cli_password = _password_from_args(args)
     relay = _parse_relay(args.mac_relay) if getattr(args, "mac_relay", None) else None
     host, port = relay if relay else (args.host, args.port)
-    page_password = getattr(args, "app", False) and not cli_password
+    page_password = ((getattr(args, "app", False) or getattr(args, "ask_password", False))
+                     and not cli_password)
     cli_advertise = _parse_advertise(args.advertise)
     # For a fixed --advertise WxH, the --hidpi mode determines the backing
     # scale. 'on'/'off' are display-independent so we resolve them here
@@ -513,6 +520,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         else getattr(args, "shared_udp_ports", False),
         udp_bind_host=relay[0] if relay else "",
         udp_local_any_port=bool(relay),
+        view_only=getattr(args, "view_only", False),
         on_session_choice=_ask_session_choice if os.environ.get("ISS_SESSION_CHOICE_URL") else None,
         control_socket=args.control_socket,
         record_pcap=args.record,
@@ -594,8 +602,32 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
                     log.warning("--display %r not understood (want N, 'all', or "
                                 "'combined') — auto-opening one window per "
                                 "monitor", args.display)
-        return run_desktop(config, auto_quit_secs=args.auto_quit_secs,
-                           display=display_idx, display_all=display_all)
+        # HPG fork: window title, launcher events and stop, password window.
+        from isharescreen.frontend.wt.hpg import EventSink
+        name = args.connection_name or args.host or config.host
+        events = EventSink(args.events, name)
+        title = f"{name} \u2014 view only" if config.view_only else name
+        session = None
+        if args.ask_password and not config.password:
+            from isharescreen.frontend.desktop.password import connect_with_prompt
+            from isharescreen.proxy.session import Session as _Session
+            connected = {}
+
+            def _connect(password: str):
+                cfg = dataclasses.replace(config, password=password)
+                s = _Session(cfg)
+                s.connect()
+                connected["config"] = cfg
+                return s
+            session, code, reason = connect_with_prompt(config.username, name, _connect)
+            if session is None:
+                events.emit("ended", reason=reason, exit_code=code)
+                return code
+            config = connected["config"]
+        return run_desktop(config, title=title, auto_quit_secs=args.auto_quit_secs,
+                           display=display_idx, display_all=display_all,
+                           session=session, events=events,
+                           exit_on_stdin_close=args.exit_on_stdin_close)
     # browser (default): H.264 pass-through needs the AVC codec path. The
     # Session reads ISS_VIDEO_CODEC at construction, so force it unless the
     # user explicitly chose a codec.

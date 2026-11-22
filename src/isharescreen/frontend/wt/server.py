@@ -65,7 +65,7 @@ from .capsule import CapsuleType, H3Capsule, H3CapsuleDecoder
 from .cert import write_cert, trust_cert_in_keychain, is_cert_trusted
 from .hpg import (AdmissionError, EventSink, TokenVerifier, clean_log_text,
                   describe_frame_timing, describe_thread_cpu,
-                  read_udp_rcvbuf_errors, thread_cpu_ticks)
+                  read_udp_rcvbuf_errors, thread_cpu_ticks, watch_stdin_close)
 
 
 log = logging.getLogger(__name__)
@@ -90,18 +90,6 @@ _BROWSER_SPS_PATCH = os.environ.get("ISS_BROWSER_SPS_PATCH", "1") != "0"
 # each frame as soon as it is decoded instead of holding back up to 16 (see
 # _sps_signal_no_reorder). ISS_BROWSER_NO_REORDER=0 turns it off for A/B.
 _BROWSER_NO_REORDER = os.environ.get("ISS_BROWSER_NO_REORDER", "1") != "0"
-
-
-def watch_stdin_close(stream, on_close) -> None:
-    """HPG fork: block until the launcher closes our stdin, then call
-    on_close(). A stop signal that works on Windows too (no SIGTERM there)."""
-    try:
-        buf = getattr(stream, "buffer", stream)
-        while buf.read(4096):
-            pass
-    except (OSError, ValueError):
-        pass
-    on_close()
 
 
 def _int_or_dash(v) -> str:

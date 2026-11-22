@@ -211,6 +211,19 @@ class _CursorImage:
     rgba: bytes
 
 
+class _NoInput:
+    """HPG fork: Session.input in a view-only session: every call (pointer,
+    keys, scroll, clipboard) is dropped."""
+
+    def __getattr__(self, name):
+        def _drop(*_args, **_kwargs):
+            return None
+        return _drop
+
+
+_NO_INPUT = _NoInput()
+
+
 def _au_has_keyframe(nalus) -> bool:
     """HPG fork: True if an access unit's slices include a keyframe."""
     from .media.avc import _nal_is_keyframe
@@ -343,6 +356,9 @@ class SessionConfig:
     # (5900/5901). For a local relay (--mac-relay) that stands in for the Mac
     # at host:port (UDP port and port+1) and forwards to the real one.
     udp_local_any_port: bool = False
+    # HPG fork: watch only. Session.input then drops every pointer, key,
+    # scroll and clipboard call, whichever frontend makes it.
+    view_only: bool = False
 
     # Local control socket: when set, the Session opens a ControlServer at
     # this path (UDS on POSIX, sidecar `.port` file on Windows) so an
@@ -1053,6 +1069,8 @@ class Session:
     def input(self) -> InputController:
         if self._input is None:
             raise RuntimeError("Session is not connected; call connect() first")
+        if self._config.view_only:
+            return _NO_INPUT
         return self._input
 
     def tile_state(self, tile_idx: int) -> Optional[TileVisState]:
@@ -1394,7 +1412,7 @@ class Session:
         # clipboard with the current host contents (msg 0x0b). HPG fork: off
         # unless ISS_CLIP=1 (upstream default was on; it syncs the Mac with the
         # machine running iss — on a gateway, that is the gateway).
-        if os.environ.get("ISS_CLIP", "0") == "1":
+        if os.environ.get("ISS_CLIP", "0") == "1" and not self._config.view_only:
             try:
                 self._input.send_clipboard_enable()
                 self._input.send_clipboard_fetch()
@@ -1651,7 +1669,7 @@ class Session:
         the platform clipboard isn't reachable (e.g. Linux without
         xclip/wl-clipboard installed) — `local_clipboard.available()`
         already logged an actionable hint at session startup."""
-        if os.environ.get("ISS_CLIP", "0") != "1":
+        if os.environ.get("ISS_CLIP", "0") != "1" or self._config.view_only:
             return
         if self._input is None:
             return

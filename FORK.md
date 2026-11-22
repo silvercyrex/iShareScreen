@@ -130,7 +130,8 @@ helping a person in their own session, and IT working in a separate session.
 - Every 10 s the log has "frame timing": time from a frame's first packet
   to its hand-off to the viewers, and from there into the QUIC stream.
 
-**Local viewer app (`--app`, `--mac-relay`)**
+**Local viewer app in a browser window (`--app`, `--mac-relay`)**
+- Superseded for the installed app by the native viewer above; kept.
 - `--app` serves the page on 127.0.0.1 with a free port and a one-time
   token and opens it in a window of its own (Edge on Windows, else
   Chrome/Chromium, with a throw-away profile; `--app-browser` to choose).
@@ -152,6 +153,28 @@ helping a person in their own session, and IT working in a separate session.
 - Tested on Linux (Chromium 156) through a stand-in relay with that
   contract: password form, wrong password, video, window close, cleanup.
   Windows not tested yet.
+
+**Native viewer for the installed app**
+- The installed HPG Mac viewer app runs iss's native window
+  (`--frontend desktop`), not a browser:
+  `iss --frontend desktop --mac-relay 127.0.0.1:P -u USER --auth nonsrp
+  (--share-without-asking [--view-only] | --alt-session) --ask-password
+  --connection-name NAME --events --exit-on-stdin-close`
+- `--ask-password`: a small native window asks for the Mac password,
+  shows "Connecting to NAME…" while iss logs in, asks again after a wrong
+  password (3 tries, each one is a failed login on the Mac), and shows a
+  refusal (no right to share, no separate session offered) in the same
+  window. The video window opens only after the login worked. Uses
+  tkinter (part of Python on Windows and macOS).
+- `--view-only` is enforced in the session: every pointer, key, scroll and
+  clipboard call is dropped, whatever frontend makes it, and the native
+  window doesn't grab the keyboard. Lab: 5 mouse moves over a view-only
+  window reached the Mac 0 times; the same moves with control, 5 times.
+- The window title is the connection name ("… — view only" when watching).
+- `--events` prints `mac_connected` and `ended` (with the reason);
+  `--exit-on-stdin-close` ends it from the launcher; the exit code says why
+  it ended (0 window closed or launcher stop, 1 connection or graphics
+  lost, 2 login failed 3 times, 3 session refused).
 
 **Separate session safety**
 - `--alt-session` refuses when the Mac offers no session choice (its screen

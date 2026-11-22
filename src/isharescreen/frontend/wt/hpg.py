@@ -245,6 +245,18 @@ def describe_frame_timing(rx_fwd: list, fwd_sent: list) -> str:
     return out
 
 
+def watch_stdin_close(stream, on_close) -> None:
+    """Block until the launcher closes our stdin, then call
+    on_close(). A stop signal that works on Windows too (no SIGTERM there)."""
+    try:
+        buf = getattr(stream, "buffer", stream)
+        while buf.read(4096):
+            pass
+    except (OSError, ValueError):
+        pass
+    on_close()
+
+
 def read_udp_rcvbuf_errors(path: str = "/proc/net/snmp") -> "Optional[int]":
     """Linux `Udp: RcvbufErrors`: datagrams the kernel dropped because a UDP
     socket's receive buffer was full. Counted per network namespace, so in a

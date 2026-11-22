@@ -1,3 +1,4 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
 """Desktop frontend: glfw window + wgpu render loop + input forwarding.
 
 The loop pumps glfw events, drains fresh tiles from `Session`, uploads
@@ -198,6 +199,9 @@ def run(
     auto_quit_secs: int = 0,
     display: int = -1,
     display_all: bool = False,
+    session: "Optional[Session]" = None,
+    events=None,
+    exit_on_stdin_close: bool = False,
     **_unused: object,
 ) -> int:
     """Open the window streaming `config`. Blocks until close (or
@@ -262,8 +266,21 @@ def run(
         log.info("fixed advertise %dx%d @%gx (rendering the picked resolution)",
                  config.advertise.width, config.advertise.height,
                  config.advertise.hidpi_scale)
-    session = Session(config)
-    session.connect()
+    # HPG fork: the password prompt may already have connected the session.
+    if session is None:
+        session = Session(config)
+        session.connect()
+    if events is not None:
+        events.emit("mac_connected", host=config.host, user=config.username,
+                    view_only=config.view_only)
+    # HPG fork: a launcher ends the session by closing our stdin.
+    _launcher_closed = threading.Event()
+    if exit_on_stdin_close:
+        import sys as _sys
+        from ..wt.hpg import watch_stdin_close
+        threading.Thread(target=watch_stdin_close,
+                         args=(_sys.stdin, _launcher_closed.set),
+                         name="stdin-watch", daemon=True).start()
 
     # Audio playback. `make_audio_sink()` returns None when the OS
     # has no usable output device or sounddevice is missing — we
@@ -697,7 +714,9 @@ def run(
     # Alt+Tab go to the remote Mac instead of the local desktop. On by
     # default; opt out with ISS_GRAB_KEYBOARD=0 (e.g. when debugging
     # local shortcuts while iss is foreground).
-    if os.environ.get("ISS_GRAB_KEYBOARD", "1") != "0":
+    # HPG fork: not in a view-only session (nothing would reach the Mac, and
+    # the grab would only take Win/Alt+Tab away from the local user).
+    if os.environ.get("ISS_GRAB_KEYBOARD", "1") != "0" and not config.view_only:
         from .keyboard_grab import make_grab
         # The Win32 backend needs to deliver intercepted keys directly
         # to iss's input pipeline (it bypasses GLFW for hooked keys —
@@ -1287,7 +1306,12 @@ def run(
                 log.error("send_dynamic_resolution failed: %s", e)
                 return
 
+    # HPG fork: why the loop ended, and the process exit code that says so.
+    end_reason, end_code = "time limit", 0
     while time.monotonic() < deadline:
+        if _launcher_closed.is_set():
+            end_reason, end_code = "launcher closed", 0
+            break
         glfw.poll_events()
         _apply_pending_cursor()
         # Hide the local OS cursor only once the overlay can actually draw —
@@ -1305,14 +1329,17 @@ def run(
             except Exception as e:
                 log.debug("could not hide local cursor: %s", e)
         if window.get_closed() or glfw.window_should_close(glfw_window):
+            end_reason, end_code = "window closed", 0
             break
         if _device_lost["v"]:
+            end_reason, end_code = "graphics device lost", 1
             break
 
         if _dynamic[0]:
             _poll_resize()
         if not session.is_connected:
             log.error("connection lost — closing viewer")
+            end_reason, end_code = "connection to the Mac lost", 1
             break
 
         # Detect canvas changes from 0x451 handler.
@@ -1449,7 +1476,10 @@ def run(
     # grab; anything left to clean up belongs to the kernel and gets
     # reclaimed by the process exit. Avoids the rare wgpu-__del__
     # deadlock at scope unwind that leaves the process hung.
-    os._exit(0)
+    if events is not None:
+        events.emit("ended", reason=end_reason, exit_code=end_code)
+    log.info("viewer ended: %s", end_reason)
+    os._exit(end_code)
 
 
 __all__ = ["run"]
