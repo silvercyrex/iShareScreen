@@ -108,6 +108,16 @@ helping a person in their own session, and IT working in a separate session.
   socket overflow"), their total in the `mac_disconnected` event
   (`video_drops`), and every 10 s "cpu by thread".
 
+**Display delay in the browser**
+- The H.264 stream sent to browsers now says it never reorders frames
+  (High profile `constraint_set3_flag`). Without that, the browser's decoder
+  held back up to 16 frames before showing one: in the lab (Chrome on
+  macOS) 282 ms from decode to output. Motion-to-photon on the LAN (mouse
+  move in the page to the Mac's reaction on screen in the page) went from
+  357 ms to 74 ms. `ISS_BROWSER_NO_REORDER=0` turns it off.
+- Every 10 s the log has "frame timing": time from a frame's first packet
+  to its hand-off to the viewers, and from there into the QUIC stream.
+
 **Separate session safety**
 - `--alt-session` refuses when the Mac offers no session choice (its screen
   shows the login window). Upstream streamed the console instead, so keys
@@ -132,7 +142,7 @@ helping a person in their own session, and IT working in a separate session.
   `ISS_WT_RESUME_BEHIND_MS` (150), `ISS_WT_KEYFRAME_RETRY_MS` (1500),
   `ISS_WT_CONGESTION` (`reno`; `cubic` was worse in the lab),
   `ISS_RCTL` (off), `ISS_WT_RCTL_SHARE` (0.8), `ISS_WT_RCTL_MIN_KBPS` (800),
-  `ISS_GIL_SWITCH_MS` (0.5).
+  `ISS_GIL_SWITCH_MS` (0.5), `ISS_BROWSER_NO_REORDER` (on).
 
 **Other**
 - `requirements.lock`: the exact, hashed set of dependencies tested together.

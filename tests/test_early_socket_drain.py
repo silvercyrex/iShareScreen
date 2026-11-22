@@ -111,3 +111,20 @@ def test_forwarded_keyframe_stops_the_repeat_requests():
     clock.t += 5.0
     assert gate.consume_fir_request() == set()
     gate.mark_keyframe_forwarded(7)     # out of range: ignored
+
+
+def test_frame_timing_line():
+    from isharescreen.frontend.wt.hpg import describe_frame_timing
+    assert describe_frame_timing([], []) == ""
+    line = describe_frame_timing([0.002] * 19 + [0.050], [0.001] * 20)
+    assert line.startswith("20 frames, receive->forward p50 2.0 p95 50.0 ms")
+    assert "forward->stream p50 1.0" in line
+
+
+def test_sps_no_reorder_signal_only_for_high_profile():
+    from isharescreen.proxy.media.avc import _sps_signal_no_reorder
+    high = bytes([0x67, 100, 0x00, 52, 0xAC, 0x2B])
+    assert _sps_signal_no_reorder(high) == bytes([0x67, 100, 0x10, 52, 0xAC, 0x2B])
+    hi422 = bytes([0x67, 122, 0x00, 52, 0xAC])
+    assert _sps_signal_no_reorder(hi422) == hi422        # set3 = "intra" there
+    assert _sps_signal_no_reorder(b"\x68\x64\x00\x34") == b"\x68\x64\x00\x34"  # not an SPS

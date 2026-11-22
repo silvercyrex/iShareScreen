@@ -58,12 +58,13 @@ from aioquic.quic.events import ProtocolNegotiated, QuicEvent
 
 from ...proxy.session import Session, SessionConfig
 from ...proxy.media.avc_nalu import au_is_keyframe, au_has_sps
-from ...proxy.media.avc import _patch_avc_sps_dpb
+from ...proxy.media.avc import _patch_avc_sps_dpb, _sps_signal_no_reorder
 from .audio import OpusEncoder
 from .capsule import CapsuleType, H3Capsule, H3CapsuleDecoder
 from .cert import write_cert, trust_cert_in_keychain, is_cert_trusted
 from .hpg import (AdmissionError, EventSink, TokenVerifier, clean_log_text,
-                  describe_thread_cpu, read_udp_rcvbuf_errors, thread_cpu_ticks)
+                  describe_frame_timing, describe_thread_cpu,
+                  read_udp_rcvbuf_errors, thread_cpu_ticks)
 
 
 log = logging.getLogger(__name__)
@@ -84,6 +85,19 @@ _DEBUG_SETTINGS = os.environ.get("ISS_WT_DEBUG_SETTINGS", "0") == "1"
 # forwarded SPS too so the browser's decoder sizes its DPB to hold Apple's full
 # reference set. ISS_BROWSER_SPS_PATCH=0 restores the old (raw) behavior for A/B.
 _BROWSER_SPS_PATCH = os.environ.get("ISS_BROWSER_SPS_PATCH", "1") != "0"
+# HPG fork: tell the browser's decoder the stream never reorders, so it shows
+# each frame as soon as it is decoded instead of holding back up to 16 (see
+# _sps_signal_no_reorder). ISS_BROWSER_NO_REORDER=0 turns it off for A/B.
+_BROWSER_NO_REORDER = os.environ.get("ISS_BROWSER_NO_REORDER", "1") != "0"
+
+
+def _browser_sps(sps: bytes) -> bytes:
+    """The SPS as sent to browsers."""
+    if _BROWSER_SPS_PATCH:
+        sps = _patch_avc_sps_dpb(sps)
+    if _BROWSER_NO_REORDER:
+        sps = _sps_signal_no_reorder(sps)
+    return sps
 
 # --- HTTP/3 SETTINGS codepoints for WebTransport ----------------------
 # aioquic 1.3 only knows the draft-02 ENABLE_WEBTRANSPORT (0x2b603742) and the
@@ -800,6 +814,9 @@ class WebTransportBridge:
         self._session_attempts = 0
         self._mac_connected_t = 0.0
         self._video_drops_last = 0
+        # HPG fork: per-frame stage times (s) since the last timing log line.
+        self._ft_rx_fwd: list = []
+        self._ft_fwd_sent: list = []
         # Opt-in: install our self-signed cert into the macOS login
         # keychain so Safari (which ignores serverCertificateHashes) can
         # do WebTransport. Set True once trusted — the page then connects
@@ -929,8 +946,15 @@ class WebTransportBridge:
                 if now_c - cpu_last[1] >= 10.0:
                     cur_c = thread_cpu_ticks()
                     if self._session is not None:
-                        log.info("cpu by thread (last %.0f s): %s", now_c - cpu_last[1],
-                                 describe_thread_cpu(cpu_last[0], cur_c, now_c - cpu_last[1]))
+                        if cur_c:
+                            log.info("cpu by thread (last %.0f s): %s", now_c - cpu_last[1],
+                                     describe_thread_cpu(cpu_last[0], cur_c,
+                                                         now_c - cpu_last[1]))
+                        timing = describe_frame_timing(self._ft_rx_fwd, self._ft_fwd_sent)
+                        if timing:
+                            log.info("frame timing (last %.0f s): %s",
+                                     now_c - cpu_last[1], timing)
+                    self._ft_rx_fwd, self._ft_fwd_sent = [], []
                     cpu_last[0], cpu_last[1] = cur_c, now_c
                 # HPG fork: kernel drops of Mac→bridge media because a socket
                 # receive buffer was full (invisible to RTP loss counting).
@@ -1495,8 +1519,8 @@ class WebTransportBridge:
         """WebCodecs codec id 'avc1.PPCCLL' from the SPS (profile/constraint/
         level bytes). Falls back to High@5.0 if the SPS isn't available yet."""
         sps, _ = session.video_params()
-        if sps and _BROWSER_SPS_PATCH:
-            sps = _patch_avc_sps_dpb(sps)
+        if sps:
+            sps = _browser_sps(sps)
         if len(sps) >= 4:
             return "avc1." + sps[1:4].hex()
         return "avc1.640032"
@@ -1510,6 +1534,11 @@ class WebTransportBridge:
         session = self._session
         if loop is None or session is None:
             return
+        # HPG fork: stage timing (first packet received -> handed to viewers).
+        fwd_t = time.monotonic()
+        rx_t = getattr(session, "last_au_rx_t", 0.0)
+        if rx_t:
+            self._ft_rx_fwd.append(fwd_t - rx_t)
         is_key = au_is_keyframe(au_bytes)
         if _PROFILE:
             now = time.monotonic()
@@ -1533,8 +1562,7 @@ class WebTransportBridge:
             # 'Decoding error' on every keyframe.
             sps, all_pps = session.video_params()
             if sps:
-                if _BROWSER_SPS_PATCH:
-                    sps = _patch_avc_sps_dpb(sps)
+                sps = _browser_sps(sps)
                 pps = next(iter(all_pps.values()), b"")
                 au_bytes = (b"\x00\x00\x00\x01" + sps
                             + b"\x00\x00\x00\x01" + pps + au_bytes)
@@ -1592,7 +1620,7 @@ class WebTransportBridge:
             # Cache the latest keyframe (SPS/PPS already prepended above) to
             # bootstrap late joiners on an idle host — see add_viewer.
             self._last_keyframe_env[tile_idx] = env
-        self._broadcast_frame(env)
+        self._broadcast_frame(env, fwd_t)
 
     def _gate_pump_loop(self) -> None:
         """Drain get_frame() for every tile so the quality gate + FIR recovery
@@ -1611,14 +1639,22 @@ class WebTransportBridge:
                 pass
             stop.wait(0.016)  # ~60 Hz
 
-    def _broadcast_frame(self, envelope: bytes) -> None:
+    def _broadcast_frame(self, envelope: bytes, fwd_t: float = 0.0) -> None:
         loop = self._loop
         if loop is None:
             return
         with self._viewers_lock:
             viewers = list(self.viewers)
         for viewer in viewers:
-            loop.call_soon_threadsafe(viewer.send_frame, envelope)
+            if fwd_t:
+                loop.call_soon_threadsafe(self._timed_send, viewer, envelope, fwd_t)
+            else:
+                loop.call_soon_threadsafe(viewer.send_frame, envelope)
+
+    def _timed_send(self, viewer, envelope: bytes, fwd_t: float) -> None:
+        """HPG fork: on the event loop — hand-off -> written to the stream."""
+        self._ft_fwd_sent.append(time.monotonic() - fwd_t)
+        viewer.send_frame(envelope)
 
     def _teardown_session(self) -> None:
         had_session = self._session is not None

@@ -222,6 +222,22 @@ def describe_thread_cpu(before: "dict[str, int]", after: "dict[str, int]",
     return ", ".join(parts) or "idle"
 
 
+def describe_frame_timing(rx_fwd: list, fwd_sent: list) -> str:
+    """'N frames, receive->forward p50 X p95 Y ms, forward->stream p50 X p95 Y
+    ms' from per-frame stage times in seconds; '' when there were none."""
+    def pct(xs: list, p: float) -> float:
+        xs = sorted(xs)
+        return xs[min(len(xs) - 1, int(p * len(xs)))] * 1000.0
+    if not rx_fwd:
+        return ""
+    out = (f"{len(rx_fwd)} frames, receive->forward p50 {pct(rx_fwd, .5):.1f} "
+           f"p95 {pct(rx_fwd, .95):.1f} ms")
+    if fwd_sent:
+        out += (f", forward->stream p50 {pct(fwd_sent, .5):.1f} "
+                f"p95 {pct(fwd_sent, .95):.1f} ms")
+    return out
+
+
 def read_udp_rcvbuf_errors(path: str = "/proc/net/snmp") -> "Optional[int]":
     """Linux `Udp: RcvbufErrors`: datagrams the kernel dropped because a UDP
     socket's receive buffer was full. Counted per network namespace, so in a

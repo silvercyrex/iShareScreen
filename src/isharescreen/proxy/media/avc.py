@@ -136,6 +136,23 @@ def _patch_avc_sps_dpb(sps: bytes) -> bytes:
         log.debug("SPS DPB patch skipped: %s", e)
         return sps
 
+def _sps_signal_no_reorder(sps: bytes) -> bytes:
+    """HPG fork: mark a High-profile SPS as never reordering frames.
+
+    Apple's SPS carries no reorder limit (no VUI bitstream_restriction), so a
+    spec-following decoder may hold back as many frames as the DPB allows
+    before showing the first: 16 at 1080p, 267 ms at 60 fps. Measured in
+    Chrome (macOS, VideoToolbox): 282 ms from decode() to output. Apple's
+    encoder never reorders (iss's own decoder runs it in low-delay mode),
+    and for High profile constraint_set3_flag = 1 means exactly that
+    (H.264 E.2.1: max_num_reorder_frames inferred 0). Not applied to the
+    High 10 / 4:2:2 / 4:4:4 profiles, where the flag means "intra only".
+    """
+    if len(sps) < 4 or (sps[0] & 0x1F) != 7 or sps[1] != 100:
+        return sps
+    return sps[:2] + bytes([sps[2] | 0x10]) + sps[3:]
+
+
 # Hardware decoders to try per platform for H.264. Unlike Apple's HEVC RExt
 # 4:4:4 (which DXVA2/D3D11VA/VAAPI cannot decode, so the "HW" context silently
 # falls back to software), H.264 4:2:0 is the universally hardware-decodable

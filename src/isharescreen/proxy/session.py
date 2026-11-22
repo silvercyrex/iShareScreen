@@ -477,6 +477,10 @@ class Session:
         self._video_q: queue.Queue[bytes] = queue.Queue(maxsize=_UDP_DRAIN_QUEUE_MAX)
         self._ctrl_q: queue.Queue[bytes] = queue.Queue(maxsize=_UDP_DRAIN_QUEUE_MAX)
         self._video_q_dropped = 0
+        # HPG fork: RTP timestamp -> arrival of the frame's first packet, and
+        # that time for the access unit being forwarded (read by the bridge).
+        self._frame_rx_t: dict[int, float] = {}
+        self.last_au_rx_t = 0.0
         self._ctrl_q_dropped = 0
         # RX/TX byte+packet counters. _rx_msg_type_counts[type] tracks
         # inbound RFB msg-type histogram on the TCP control channel —
@@ -2481,7 +2485,7 @@ class Session:
                         loss_count += 1
                         continue
             try:
-                q.put_nowait(pkt)
+                q.put_nowait((pkt, time.monotonic()))   # HPG fork: arrival time
             except queue.Full:
                 self._video_q_dropped += 1
 
@@ -2490,9 +2494,10 @@ class Session:
         if decryptor is None:
             return
         q = self._video_q
+        frame_rx_t = self._frame_rx_t
         while not self._stop_evt.is_set():
             try:
-                pkt = q.get(timeout=_UDP_RECV_TIMEOUT_S)
+                pkt, t_rx = q.get(timeout=_UDP_RECV_TIMEOUT_S)
             except queue.Empty:
                 self._evict_stale_groups()
                 continue
@@ -2505,6 +2510,11 @@ class Session:
             seq = struct.unpack(">H", hdr[2:4])[0]
             ts = struct.unpack(">I", hdr[4:8])[0]
             marker = bool(hdr[1] & 0x80)
+            # HPG fork: when each frame's first packet arrived (stage timing).
+            if ts not in frame_rx_t:
+                if len(frame_rx_t) > 512:
+                    frame_rx_t.clear()
+                frame_rx_t[ts] = t_rx
 
             self._track_seq(ssrc, seq)
             self._note_unknown_ssrc(ssrc)
@@ -2785,6 +2795,7 @@ class Session:
             au_parts = [b"\x00\x00\x00\x01" + bytes(n) for n in nalus]
             if au_parts:
                 try:
+                    self.last_au_rx_t = self._frame_rx_t.pop(key[1], 0.0)
                     au_cb(ti, key[1], b"".join(au_parts))
                     # Advance the stall clock ONLY on a successful forward —
                     # in pass-through this is the sole liveness signal (no local
