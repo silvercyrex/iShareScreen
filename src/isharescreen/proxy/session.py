@@ -1,3 +1,5 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
+# See FORK.md for the list of changes.
 """High-level Session orchestrating the full Apple HP screen-share pipeline.
 
 A `Session` wraps:
@@ -1371,13 +1373,17 @@ class Session:
         cw = self._negotiation.canvas_width if self._negotiation else 0
         ch = self._negotiation.canvas_height if self._negotiation else 0
         pkts = last_starved.packets if last_starved else 0
+        # HPG fork: codec-neutral wording, and the cause seen most often on
+        # macOS 27: reconnecting to an existing --alt-session login.
         raise RuntimeError(
-            f"HP stream never started: {pkts} HEVC video packets arrived across "
+            f"HP stream never started: {pkts} video packets arrived across "
             f"{_BURST_RETRY_ATTEMPTS} fresh handshakes. The host accepted a "
             f"{cw}x{ch} encoder canvas over IPv4, but screensharingd never sent "
-            f"any RTP -- a host-side stall. On the Mac, toggle Screen Sharing "
-            f"off/on in System Settings (clears a wedged agent), then reconnect; "
-            f"--no-curtain (mirror the physical screen) can also help."
+            f"any RTP -- a host-side stall. If this was --alt-session and that "
+            f"user was already logged in on the Mac (a reconnect), log that user "
+            f"out on the Mac and try again. Otherwise, on the Mac, toggle Screen "
+            f"Sharing off/on in System Settings (clears a wedged agent), then "
+            f"reconnect."
         )
 
     def _negotiate_and_burst(self, cfg) -> InitialBurst:

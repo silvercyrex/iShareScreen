@@ -1,3 +1,5 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
+# See FORK.md for the list of changes.
 """Self-signed certificate generation for WebTransport.
 
 WebTransport requires HTTPS / HTTP/3, which means TLS. For a LAN tool

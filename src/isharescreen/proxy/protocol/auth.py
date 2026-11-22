@@ -1,3 +1,5 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
+# See FORK.md for the list of changes.
 """RFB authentication: Apple's SRP-RFC5054-4096-SHA512-PBKDF2 and the legacy
 non-SRP RSA1+AES path.
 

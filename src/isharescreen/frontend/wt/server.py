@@ -1,3 +1,5 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
+# See FORK.md for the list of changes.
 """WebTransport bridge server.
 
 aioquic provides QUIC + HTTP/3 + WebTransport. We accept HTTP CONNECT

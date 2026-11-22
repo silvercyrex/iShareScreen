@@ -1,3 +1,5 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
+# See FORK.md for the list of changes.
 """`iss` command-line entry point.
 
 Modes:

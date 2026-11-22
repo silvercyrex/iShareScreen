@@ -1,3 +1,5 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
+# See FORK.md for the list of changes.
 """TCP-side handshake driver: from `socket.connect()` to the SRTP keys.
 
 Sequence (per Apple HP-mode RE):
