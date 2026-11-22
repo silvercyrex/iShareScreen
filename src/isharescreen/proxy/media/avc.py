@@ -1,3 +1,4 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
 """H.264 (AVC) decoder for Apple's screen stream.
 
 Apple sends H.264 4:2:0 (yuvj420p) when the client advertises the field1=123

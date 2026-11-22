@@ -787,6 +787,10 @@ class WebTransportBridge:
         idle_timeout_s: float = 0.0,
         exit_after_session: bool = False,
         source_url: str = "",
+        app: bool = False,
+        app_browser: str = "",
+        password_from_page: bool = False,
+        mac_name: str = "",
     ) -> None:
         # HPG fork: this frontend forwards the Mac's H.264 to the browsers and
         # never uses iss's own decode, so the session skips decoding the burst.
@@ -803,6 +807,14 @@ class WebTransportBridge:
         self._idle_timeout_s = max(0.0, idle_timeout_s)
         self._exit_after_session = exit_after_session
         self.source_url = source_url
+        # HPG fork: --app opens its own window; with no password given, the
+        # page asks for it (3 tries: each wrong one is a failed login).
+        self._app = app
+        self._app_browser = app_browser
+        self._app_window = None
+        self._password_from_page = password_from_page
+        self._pw_tries_left = 3
+        self._mac_name = mac_name or config.host
         self._pending: set = set()
         self._controller = None          # the one viewer allowed to send input
         self._owner = None               # first admitted, non-joiner viewer
@@ -1049,6 +1061,12 @@ class WebTransportBridge:
             **({"token": self._admission.token}
                if isinstance(self._admission, TokenVerifier) else {}),
         )
+        if self._app and isinstance(self._admission, TokenVerifier):
+            from .app import open_app_window
+            url = f"http://{self._bind}:{self._port}/#token={self._admission.token}"
+            self._app_window = await asyncio.get_running_loop().run_in_executor(
+                None, open_app_window, url, self._app_browser,
+                lambda: self.stop("window closed"))
         await self._stop_event.wait()
 
     async def _start_http_bootstrap(self, hosts: list) -> None:
@@ -1121,6 +1139,12 @@ class WebTransportBridge:
             self._end_reason = self._end_reason or "interrupted"
         finally:
             self._teardown_session()
+            if self._app_window is not None:
+                # Window closed or the page left: nothing to show. Otherwise
+                # the page shows why it ended; close it when the user does
+                # (at most 10 minutes later).
+                gone = self._end_reason in ("window closed", "viewer left")
+                self._app_window.finish(wait_s=0 if gone else 600)
         if self._exit_code:
             import sys as _sys
             print(f"iss bridge: {self._end_reason}", file=_sys.stderr)
@@ -1274,15 +1298,10 @@ class WebTransportBridge:
         with self._viewers_lock:
             self.viewers.append(viewer)
             if self._session is None and not self._session_starting:
-                self._session_starting = True
-                # Run session.connect() in a thread — it does sync
-                # SRP+RFB+burst gather (5-10s). On the asyncio loop
-                # this would freeze QUIC event processing and Chrome
-                # times out the WT keepalive.
-                threading.Thread(
-                    target=self._start_session_thread,
-                    name="wt-session-start", daemon=True,
-                ).start()
+                if self._needs_password():
+                    self._ask_password(viewer)
+                else:
+                    self._start_session()
             elif self._session is not None:
                 # Late joiner: resend the geometry/codec config, and FIR all
                 # tiles so a fresh keyframe (with SPS/PPS prepended in
@@ -1363,6 +1382,42 @@ class WebTransportBridge:
 
     # -- session + encoder lifecycle ----------------------------------
 
+    def _start_session(self) -> None:
+        """Start the Mac session off the event loop (call with the viewers
+        lock held). session.connect() does sync SRP+RFB+burst gather (5-10s);
+        on the asyncio loop this would freeze QUIC event processing and
+        Chrome times out the WT keepalive."""
+        self._session_starting = True
+        threading.Thread(
+            target=self._start_session_thread,
+            name="wt-session-start", daemon=True,
+        ).start()
+
+    # HPG fork: Mac password typed in the page (--app without --password-stdin).
+    def _needs_password(self) -> bool:
+        return self._password_from_page and not self._config.password
+
+    def _ask_password(self, viewer, error: str = "") -> None:
+        viewer.send_control({"type": "need_password", "user": self._config.username,
+                             "name": self._mac_name, "error": error,
+                             "tries_left": self._pw_tries_left})
+
+    def _take_password(self, value) -> None:
+        if not isinstance(value, str) or not value or len(value) > 256:
+            return
+        with self._viewers_lock:
+            if self._session is not None or self._session_starting \
+                    or not self._needs_password():
+                return
+            self._config = dataclasses.replace(self._config, password=value)
+            self._start_session()
+
+    def _password_refused(self, reason: str) -> None:
+        """On the loop: the Mac refused the typed password; ask again."""
+        self._config = dataclasses.replace(self._config, password="")
+        for v in list(self.viewers):
+            self._ask_password(v, error=reason)
+
     def _start_session_thread(self) -> None:
         """Off-loop: do the slow SRP+RFB+burst dance, then install
         encoder + start the pump thread. Runs once per bridge
@@ -1435,6 +1490,12 @@ class WebTransportBridge:
             from ...proxy.protocol.auth import AuthError as _AuthError
             if isinstance(e, _AuthError):
                 log.error("Mac login failed: %s", e)
+                if self._password_from_page:
+                    self._pw_tries_left -= 1
+                    if self._pw_tries_left > 0 and self._loop is not None:
+                        self._loop.call_soon_threadsafe(
+                            self._password_refused, "wrong user name or password")
+                        return
                 self.stop(f"Mac login failed: {e}", exit_code=2)
                 return
             if "session-select" in str(e):
@@ -1693,7 +1754,7 @@ class WebTransportBridge:
         self._video_drops_last = 0
         if had_session:
             self._events.emit("mac_disconnected", video_drops=video_drops)
-        log.info("iss session torn down (video socket drops: %s)", video_drops)
+            log.info("iss session torn down (video socket drops: %s)", video_drops)
 
     # -- input handling -----------------------------------------------
 
@@ -1736,6 +1797,10 @@ class WebTransportBridge:
             self._authenticate(viewer, msg)
             return
         kind = msg.get("type")
+        if kind == "mac_password":
+            # Allowed for view-only viewers too: it's the Mac login, not input.
+            self._take_password(msg.get("password"))
+            return
         if kind == "log":
             # Browser diagnostics, now over the authenticated stream (was an
             # open POST /log). One bounded line, at debug unless an error.

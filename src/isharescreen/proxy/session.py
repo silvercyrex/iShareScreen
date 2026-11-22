@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional
 
 import numpy as np
@@ -247,7 +247,7 @@ class SessionConfig:
 
     host: str
     username: str
-    password: str
+    password: str = field(repr=False)   # HPG fork: never in a printed config
     port: int = 5900
     auth_mode: Literal["srp", "nonsrp"] = "srp"
     advertise: Optional[AdvertiseDims] = None
@@ -339,6 +339,10 @@ class SessionConfig:
     # UDP socket).
     udp_connect: bool = False
     udp_bind_host: str = ""  # "" = INADDR_ANY
+    # HPG fork: bind the two media sockets on free ports instead of the Mac's
+    # (5900/5901). For a local relay (--mac-relay) that stands in for the Mac
+    # at host:port (UDP port and port+1) and forwards to the real one.
+    udp_local_any_port: bool = False
 
     # Local control socket: when set, the Session opens a ControlServer at
     # this path (UDS on POSIX, sidecar `.port` file on Windows) so an
@@ -1130,6 +1134,8 @@ class Session:
         # loop demuxes audio RTP from RTCP by RTP payload-type byte.
         ctrl_port = cfg.udp_ctrl_port or cfg.port
         video_port = cfg.udp_video_port or (cfg.port + 1)
+        if cfg.udp_local_any_port:
+            ctrl_port = video_port = 0
         # Bind host defaults to INADDR_ANY but can be pinned to one interface
         # (config field or ISS_UDP_BIND_HOST env) so a client can run on a host
         # already serving screen-share on 5900-5902 on a DIFFERENT interface IP
@@ -1154,7 +1160,8 @@ class Session:
                 "UDP bound: ctrl=%s:%d video=%s:%d -> sending to %s:%d/%s:%d",
                 *self._sock_ctrl.getsockname()[:2],
                 *self._sock_video.getsockname()[:2],
-                self._dest_host, ctrl_port, self._dest_host, video_port,
+                self._dest_host, self._ctrl_dest_port,
+                self._dest_host, self._video_dest_port,
             )
         except Exception:
             pass
@@ -2446,7 +2453,7 @@ class Session:
                 pkt, _addr = sock.recvfrom(65536)
             except socket.timeout:
                 continue
-            except ConnectionRefusedError:
+            except (ConnectionRefusedError, ConnectionResetError):  # Windows: reset
                 continue   # HPG fork: connected socket, ICMP from a punch
             except OSError:
                 return
@@ -3166,7 +3173,7 @@ class Session:
                 pkt, _addr = sock.recvfrom(65536)
             except socket.timeout:
                 continue
-            except ConnectionRefusedError:
+            except (ConnectionRefusedError, ConnectionResetError):  # Windows: reset
                 continue   # HPG fork: connected socket, ICMP from a punch
             except OSError:
                 return
@@ -4762,7 +4769,7 @@ class Session:
         while time.monotonic() < deadline:
             try:
                 pkt, _ = sock.recvfrom(65536)
-            except ConnectionRefusedError:
+            except (ConnectionRefusedError, ConnectionResetError):  # Windows: reset
                 continue   # HPG fork: connected socket, ICMP from a punch
             except socket.timeout:
                 # Burst typically lands within 200-400 ms; once we see

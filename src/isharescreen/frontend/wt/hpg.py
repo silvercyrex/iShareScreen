@@ -138,14 +138,21 @@ class TicketVerifier:
 class TokenVerifier:
     """Local (non-launcher) mode: one random token, printed at start-up."""
 
-    def __init__(self, token: Optional[str] = None, read_only: bool = False) -> None:
+    def __init__(self, token: Optional[str] = None, read_only: bool = False,
+                 one_time: bool = False) -> None:
         self.token = token or secrets.token_urlsafe(24)
         self._read_only = read_only
+        # --app: the token is in the browser's command line, which other
+        # local users can read on Linux, so it works once.
+        self._one_time = one_time
+        self._used = False
 
     def check(self, token: str) -> Admission:
-        if not isinstance(token, str) or not hmac.compare_digest(
+        if self._used or not isinstance(token, str) or not hmac.compare_digest(
                 token.encode(), self.token.encode()):
             raise AdmissionError("bad token")
+        if self._one_time:
+            self._used = True
         return Admission(user="local", sid="local", read_only=self._read_only)
 
 

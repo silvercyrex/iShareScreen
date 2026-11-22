@@ -177,6 +177,25 @@ def _make_parser() -> argparse.ArgumentParser:
         "process connects its sockets to its own Mac)",
     )
     g.add_argument(
+        "--mac-relay", metavar="HOST:PORT",
+        help="reach the Mac through a local relay instead of directly: TCP "
+        "HOST:PORT carries its TCP 5900, UDP HOST:PORT and PORT+1 its UDP "
+        "5900/5901; iss binds its own UDP sockets on HOST with free ports "
+        "(replaces --host/--port)",
+    )
+    g.add_argument(
+        "--app", action="store_true",
+        help="local viewer app: serve the page on 127.0.0.1 with a free port "
+        "and a one-time token, open it in its own Edge/Chrome window, and exit "
+        "when that window closes. Without --password-stdin the page asks for "
+        "the Mac password",
+    )
+    g.add_argument(
+        "--app-browser", default="", metavar="PATH",
+        help="with --app: the Chromium-family browser to open (default: Edge "
+        "on Windows, else Chrome/Chromium; else the default browser)",
+    )
+    g.add_argument(
         "--source-url", default=FORK_SOURCE_URL, metavar="URL",
         help="'Source code' link shown on the viewer page (AGPL section 13); "
         "point it at the exact commit that is running",
@@ -434,6 +453,9 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     viewer, both of which always pass the full set of flags. Interactive
     use goes through `isharescreen.tui` instead."""
     cli_password = _password_from_args(args)
+    relay = _parse_relay(args.mac_relay) if getattr(args, "mac_relay", None) else None
+    host, port = relay if relay else (args.host, args.port)
+    page_password = getattr(args, "app", False) and not cli_password
     cli_advertise = _parse_advertise(args.advertise)
     # For a fixed --advertise WxH, the --hidpi mode determines the backing
     # scale. 'on'/'off' are display-independent so we resolve them here
@@ -461,8 +483,8 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     )
     missing = [
         label for label, value in
-        (("--host", args.host), ("-u/--user", args.user),
-         ("--password-stdin", cli_password))
+        (("--host", host), ("-u/--user", args.user),
+         ("--password-stdin", cli_password or page_password))
         if not value
     ]
     if missing:
@@ -471,7 +493,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
             " (run plain `iss` for the interactive connect GUI)"
         )
     return SessionConfig(
-        host=args.host, port=args.port,
+        host=host, port=port,
         username=args.user, password=cli_password or "",
         auth_mode=args.auth,
         advertise=cli_advertise,
@@ -482,7 +504,10 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         audio=args.audio,
         share_console=args.share_console, alt_session=args.alt_session,
         share_without_asking=args.share_without_asking,
-        udp_connect=getattr(args, "shared_udp_ports", False),
+        udp_connect=(sys.platform == "linux") if relay
+        else getattr(args, "shared_udp_ports", False),
+        udp_bind_host=relay[0] if relay else "",
+        udp_local_any_port=bool(relay),
         on_session_choice=_ask_session_choice if os.environ.get("ISS_SESSION_CHOICE_URL") else None,
         control_socket=args.control_socket,
         record_pcap=args.record,
@@ -531,7 +556,7 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
     """Open the selected frontend. Default is the browser (WebTransport +
     WebCodecs, H.264 pass-through) since every machine has a browser; the
     native wgpu/desktop viewer stays available via --frontend desktop."""
-    if args.frontend == "desktop":
+    if args.frontend == "desktop" and not args.app:
         # Auto codec ladder: offer HEVC when this machine has a HEVC 4:4:4
         # hardware decoder (VideoToolbox / generic HW / QSV), else fall back to
         # H.264 (libav-avc420, HW with SW floor). Only force AVC here — when
@@ -590,20 +615,41 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
         admission = TicketVerifier(_read_ticket_key(args.ticket_key_file),
                                    host=config.host, port=config.port)
     else:
-        admission = TokenVerifier(read_only=args.view_only)
+        admission = TokenVerifier(read_only=args.view_only, one_time=args.app)
+    bind, bridge_port = args.bind, args.bridge_port
+    if args.app:
+        from isharescreen.frontend.wt.app import free_port
+        bind = "127.0.0.1"
+        bridge_port = free_port(bind)
     return run_browser(
-        config, port=args.bridge_port,
+        config, port=bridge_port,
         trust_cert_for_safari=getattr(args, "trust_cert_for_safari", False),
-        bind=args.bind,
+        bind=bind,
         admission=admission,
         events=EventSink(args.events, args.connection_name or config.host),
-        serve_page=args.serve_page,
+        serve_page=args.serve_page or args.app,
         view_only=args.view_only,
         linger_s=args.linger,
         idle_timeout_s=args.idle_timeout,
-        exit_after_session=args.exit_after_session,
+        exit_after_session=args.exit_after_session or args.app,
         source_url=args.source_url,
+        app=args.app,
+        app_browser=args.app_browser,
+        password_from_page=args.app and not config.password,
+        mac_name=args.connection_name or args.host or config.host,
     )
+
+
+def _parse_relay(text: str) -> "tuple[str, int]":
+    """HPG fork: --mac-relay HOST:PORT (PORT+1 must exist too)."""
+    host, sep, port_s = text.rpartition(":")
+    try:
+        port = int(port_s)
+    except ValueError:
+        port = 0
+    if not sep or not host or not 1 <= port <= 65534:
+        raise SystemExit(f"--mac-relay {text!r}: want HOST:PORT")
+    return host, port
 
 
 def _read_ticket_key(path: str) -> bytes:

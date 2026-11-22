@@ -1,3 +1,4 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
 """Per-tile decoder-recovery state.
 
 The recovery logic is *not* heuristic. We do not look at the pixel

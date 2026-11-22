@@ -118,6 +118,26 @@ helping a person in their own session, and IT working in a separate session.
 - Every 10 s the log has "frame timing": time from a frame's first packet
   to its hand-off to the viewers, and from there into the QUIC stream.
 
+**Local viewer app (`--app`, `--mac-relay`)**
+- `--app` serves the page on 127.0.0.1 with a free port and a one-time
+  token and opens it in a window of its own (Edge on Windows, else
+  Chrome/Chromium, with a throw-away profile; `--app-browser` to choose).
+  iss exits when that window closes. If the Mac session ends first, the
+  window shows why and closes when the user closes it (at most 10 minutes).
+- Without `--password-stdin` the page asks for the Mac password; it goes
+  only to iss over that connection. Three tries (each wrong one is a
+  failed login on the Mac), then exit code 2.
+- `--mac-relay HOST:PORT` reaches the Mac through a local relay: TCP
+  HOST:PORT for its TCP 5900 (iss opens several connections), UDP
+  HOST:PORT and PORT+1 for its UDP 5900/5901. iss binds its UDP sockets
+  on HOST with free ports and sends 1-byte packets from both every 100 ms
+  during the handshake, so the relay learns their addresses. The relay
+  must receive the Mac's media on UDP 5900/5901 of the address its TCP
+  connection comes from.
+- Tested on Linux (Chromium 156) through a stand-in relay with that
+  contract: password form, wrong password, video, window close, cleanup.
+  Windows not tested yet.
+
 **Separate session safety**
 - `--alt-session` refuses when the Mac offers no session choice (its screen
   shows the login window). Upstream streamed the console instead, so keys

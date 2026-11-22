@@ -1,3 +1,4 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
 """H.264 (AVC) NAL reassembly + decoder-config parse for Apple's RTP format.
 
 Apple's server sends H.264 4:2:0 when the client advertises the field1=123

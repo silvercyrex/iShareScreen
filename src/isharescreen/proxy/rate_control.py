@@ -1,3 +1,4 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
 """Receiver rate-control feedback (RTCP APP "RCTL").
 
 Apple's own Screen Sharing viewer sends, besides RRs and LTR acks, one

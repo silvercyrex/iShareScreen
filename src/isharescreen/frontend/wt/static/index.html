@@ -106,6 +106,13 @@
   #src-link { flex: 0 0 auto; color: #9cc8ff; text-decoration: none; white-space: nowrap; }
   /* HPG fork: key bar (latching modifiers + keys a browser can't send). */
   #keybar { flex: 0 0 auto; display: flex; gap: 3px; align-items: center; }
+  /* HPG fork: Mac password form (--app without a password given) */
+  #pwbox { position: fixed; inset: 0; display: none; align-items: center;
+    justify-content: center; background: rgba(0,0,0,.55); z-index: 20; }
+  #pwbox form { background: #1c1c1e; color: #eee; padding: 20px 22px; border-radius: 10px;
+    min-width: 300px; display: flex; flex-direction: column; gap: 10px; }
+  #pwbox input, #pwbox button { font: inherit; padding: 6px 8px; }
+  #pwerr { color: #ff6b6b; min-height: 1.2em; }
   #keybar button, #keybar select {
     background: rgba(255,255,255,.08); color: #fff;
     border: 1px solid rgba(255,255,255,.18); border-radius: 4px;
@@ -119,6 +126,12 @@
 </head>
 <body>
 <div id="stage"><canvas id="screen" width="1280" height="800"></canvas></div>
+<div id="pwbox"><form id="pwform" autocomplete="off">
+  <div id="pwtitle">Mac password</div>
+  <input id="pwinput" type="password" autocomplete="current-password" aria-label="Mac password">
+  <div id="pwerr"></div>
+  <button type="submit">Connect</button>
+</form></div>
 <div id="topbar">
   <span id="status">connecting…</span>
   <span id="keybar" role="toolbar" aria-label="Keys for the Mac">
@@ -894,7 +907,10 @@ async function main() {
         } else if (m.type === "auth_failed") {
           setStatus(`not allowed: ${m.reason || "refused"}`, "err");
         } else if (m.type === "ended") {
+          pwBox.style.display = "none";
           setStatus(`session ended: ${m.reason || ""}`, "err");
+        } else if (m.type === "need_password") {
+          showPasswordBox(m);
         }
       }
     }
@@ -927,6 +943,32 @@ async function main() {
         b.setAttribute("aria-pressed", on ? "true" : "false");
       }
     });
+  // HPG fork: the Mac password, typed here (iss --app without a password);
+  // it goes to iss over this connection only.
+  const pwBox = document.getElementById("pwbox");
+  function showPasswordBox(m) {
+    document.getElementById("pwtitle").textContent =
+      `Mac password for ${m.user || "?"} on ${m.name || "the Mac"}`;
+    const left = m.tries_left;
+    document.getElementById("pwerr").textContent = m.error
+      ? `${m.error} (${left} ${left === 1 ? "try" : "tries"} left)` : "";
+    pwBox.style.display = "flex";
+    const inp = document.getElementById("pwinput");
+    inp.value = "";
+    inp.focus();
+    setStatus("waiting for the Mac password");
+  }
+  document.getElementById("pwform").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const inp = document.getElementById("pwinput");
+    const v = inp.value;
+    inp.value = "";
+    if (!v) return;
+    pwBox.style.display = "none";
+    send({type: "mac_password", password: v});
+    setStatus("signing in to the Mac…");
+  });
+
   function setKeybarEnabled(on) {
     for (const el of keybar.querySelectorAll("button, select")) el.disabled = !on;
     if (!on) latch.clear();
@@ -1131,6 +1173,7 @@ async function main() {
   }, { passive: false });
 
   document.addEventListener("keydown", (e) => {
+    if (pwBox.contains(e.target)) return;   // HPG fork: typing the Mac password
     if (e.metaKey && e.key === "w") return;  // let the user close the tab
     e.preventDefault();
     const ks = keysymFromEvent(e);
@@ -1140,6 +1183,7 @@ async function main() {
     }
   });
   document.addEventListener("keyup", (e) => {
+    if (pwBox.contains(e.target)) return;
     e.preventDefault();
     const ks = keysymFromEvent(e);
     if (ks) {

@@ -1,3 +1,4 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
 """HEVC bitstream primitives — what the rest of the package needs.
 
 A NAL unit's payload is RBSP — Raw Byte Sequence Payload — with 0x03

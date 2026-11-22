@@ -1,3 +1,4 @@
+# Modified by the HPG fork (https://github.com/silvercyrex/iShareScreen), 2026-11.
 """`iss` console-script entry. Routes between the browser connect GUI
 (default) and the script-friendly CLI (`--host …`, `--headless`, `--help`,
 `--version`).
@@ -24,7 +25,10 @@ def main() -> int:
     # A connection / session on the command line (`--host …`), or the
     # script/help flags, run the cli directly with no GUI — this is also how
     # the GUI form launches the actual session under the hood.
-    if "--host" in argv or any(a in _CLI_ROUTING_FLAGS for a in argv):
+    # HPG fork: --mac-relay and --app replace --host (also as --flag=value).
+    if "--host" in argv or any(a.split("=", 1)[0] in _CLI_ROUTING_FLAGS
+                               or a.split("=", 1)[0] in ("--mac-relay", "--app")
+                               for a in argv):
         from isharescreen.cli import main as cli_main
         return cli_main()
     # Default: the browser connect form + live diagnostics dashboard.
