@@ -68,12 +68,54 @@ helping a person in their own session, and IT working in a separate session.
   black screen on machines without a hardware H.264 decoder), and skips to
   the next full frame when the computer can't keep up instead of freezing.
 
+**Slow and lossy connections (2026-11-22)**
+- A still screen (e.g. a login window) no longer makes the bridge ask the
+  Mac for a full ~250 KB keyframe about every second; on a slow connection
+  that alone froze the picture and delayed keys by 3-4 s.
+- A viewer that falls behind is judged in time on its own connection
+  (more than 0.5 s of video queued, not counting a keyframe on its way),
+  frames are skipped until a fresh keyframe, which is requested again every
+  1.5 s until it gets through. Same for the per-frame transport when a
+  frame can't be sent.
+- Media sockets ask for an 8 MB receive buffer and log what the kernel
+  gave (the host's `net.core.rmem_max` caps it; 16 MB recommended). Kernel
+  buffer drops are logged and shown on the page.
+- Status line: "no change Ns" for a still screen, "catching up" only while
+  a viewer waits for a keyframe, "skipped N", "buffer drops N".
+- Lab (50 ms delay, 1% loss, 10 Mbit/s towards the browser): key to
+  picture on a still screen 3.2 s -> 0.08 s; full-screen animation
+  0.9 fps with 6 s freezes -> 4-9 fps.
+
+**Key bar**
+- Latching Command, Option, Control, Shift (held until the next key or
+  click, a second click releases), Caps Lock, Esc, Tab, Return, arrows,
+  F1-F12. Applies to the next mouse click too. Disabled for view-only
+  viewers. An embedding page may send `{type: "iss-keys", action:
+  "toggle"|"tap"|"combo"|"clear", keys: [...]}`.
+
+**Separate session safety**
+- `--alt-session` refuses when the Mac offers no session choice (its screen
+  shows the login window). Upstream streamed the console instead, so keys
+  meant for the user's own session went into the login window.
+
 **Audio**
 - Includes upstream pull request #32 by Vincent Janelle (not yet merged
   upstream): the Mac's audio is decoded with the bundled PyAV on Linux and
   Windows. Ubuntu's `libfdk-aac2` package lacks the part Apple's audio needs,
   so without this a Linux gateway had no audio. Browsers only start sound
   after the viewer clicks the speaker button.
+
+**Bitrate feedback (optional)**
+- Includes upstream pull request #34 by Charles Vestal (not yet merged
+  upstream): Apple's RCTL receiver rate feedback. With `ISS_RCTL=1` the
+  bridge caps it at 80% of the slowest viewer's connection rate. Off by
+  default: its effect on the Mac's H.264 encoder is not measured yet.
+
+**Settings (environment)**
+- `ISS_UDP_RCVBUF` (bytes, default 8 MB), `ISS_WT_MAX_BEHIND_MS` (500),
+  `ISS_WT_RESUME_BEHIND_MS` (150), `ISS_WT_KEYFRAME_RETRY_MS` (1500),
+  `ISS_WT_CONGESTION` (`reno`; `cubic` was worse in the lab),
+  `ISS_RCTL` (off), `ISS_WT_RCTL_SHARE` (0.8), `ISS_WT_RCTL_MIN_KBPS` (800).
 
 **Other**
 - `requirements.lock`: the exact, hashed set of dependencies tested together.
