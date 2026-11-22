@@ -244,25 +244,26 @@ def _phase_auth(
     host: str, port: int, username: str, password: str, mode: str,
     recorder=None,
 ) -> tuple[socket.socket, bytes]:
-    """Open TCP, run auth (with fallback on AuthError), return live socket
-    and the 16-byte enc1103 master key."""
-    primary, fallback = (
-        (do_srp_auth, do_nonsrp_auth) if mode == "srp"
-        else (do_nonsrp_auth, do_srp_auth)
-    )
+    """Open TCP, run auth in exactly the requested mode, return live socket
+    and the 16-byte enc1103 master key.
 
+    HPG fork: no automatic fallback. Upstream retried with the other mode on
+    any AuthError, which silently downgraded SRP to the non-SRP path (the
+    password RSA-encrypted to an unverified server key) whenever one forged
+    or short SRP reply arrived. The non-SRP path now runs only when the
+    caller asks for it explicitly (`--auth nonsrp`)."""
+    do_auth = do_srp_auth if mode == "srp" else do_nonsrp_auth
     sock = _open_socket_and_handshake(host, port, recorder)
     try:
-        return sock, primary(sock, username, password)
+        return sock, do_auth(sock, username, password)
     except AuthError as e:
-        log.warning(
-            "%s failed (%s); falling back to %s",
-            primary.__name__, e, fallback.__name__,
-        )
         sock.close()
-
-    sock = _open_socket_and_handshake(host, port, recorder)
-    return sock, fallback(sock, username, password)
+        if mode == "srp":
+            raise AuthError(
+                f"SRP login failed ({e}). This Mac may not offer SRP; the older "
+                f"login is only used when asked for with --auth nonsrp"
+            ) from e
+        raise
 
 
 # ── phase 2: ClientInit + ServerInit ──────────────────────────────────
@@ -293,15 +294,24 @@ _SS_MAGIC = b"\x00\x4a\x00\x01"
 _SS_POPUP_TIMEOUT_S = 60.0
 
 
-def _build_ss_cmd0_body(console_user: str) -> bytes:
-    """Build the 72-byte SessionSelect cmd=0 body. Triggers
-    `SSAgent_GuestAccessAskUser_rpc` on the console user's screen — they
-    click Allow → this viewer joins their session in observe-only mode."""
+def _build_ss_cmd0_body(console_user: str, *, cmd: int = 0) -> bytes:
+    """Build the 72-byte SessionSelect share-console body.
+
+    cmd=0 triggers `SSAgent_GuestAccessAskUser_rpc` on the console user's
+    screen — they click Allow → this viewer joins their session in
+    observe-only mode.
+
+    cmd=1 (HPG fork) shares the console user's screen without asking. The
+    daemon only offers it (bit 1 of the prompt's flags) to an account with
+    Remote Management rights; it acks at once and macOS shows its own
+    "Your screen is being observed" notice. Verified on macOS 27.2.1."""
+    if cmd not in (0, 1):
+        raise ValueError(f"share-console cmd must be 0 or 1, got {cmd}")
     machine = b"\x00"
     body = (
         struct.pack(">HH", 2, 0x0000)
         + b"\x00\x00"
-        + bytes([0]) + b"\x00"             # cmd byte at body[6] = 0
+        + bytes([cmd]) + b"\x00"           # cmd byte at body[6]
         + console_user.encode() + b"\x00"
         + machine
     )
@@ -414,7 +424,7 @@ def _peek_ss_console_user(sock: socket.socket, wait: float = 2.0) -> str:
 def _phase_session_select(
     sock: socket.socket,
     *,
-    mode: str,            # "share_console" or "alt_session"
+    mode: str,            # "share_console", "share_console_no_ask" or "alt_session"
     username: str,
     password: str,
     ecb_key: bytes,
@@ -455,6 +465,14 @@ def _phase_session_select(
 
     if mode == "share_console":
         cmd, body = 0, _build_ss_cmd0_body(console_user)
+    elif mode == "share_console_no_ask":
+        if not (flags >> 1) & 1:
+            raise RuntimeError(
+                f"session-select: this Mac does not offer sharing without "
+                f"asking (flags=0x{flags:x}); the account needs Remote "
+                f"Management rights on the Mac"
+            )
+        cmd, body = 1, _build_ss_cmd0_body(console_user, cmd=1)
     elif mode == "alt_session":
         cmd, body = 2, _build_ss_cmd2_body(username, password, ecb_key)
     else:
@@ -682,6 +700,7 @@ def connect_and_negotiate(
     video_offer: Optional[bytes] = None,
     share_console: bool = False,
     alt_session: bool = False,
+    share_without_asking: bool = False,
     on_session_choice=None,   # callable () -> "share_console" | "alt_session"
     recorder=None,
 ) -> NegotiationResult:
@@ -761,7 +780,12 @@ def connect_and_negotiate(
         # AES-128-ECB(ecb_key, username/password) at body+0x48/+0x88;
         # the daemon decrypts under conn2's freshly-derived ecb_key.
         # For cmd=0 it's a 72-byte plain login_info.
-        mode = "alt_session" if alt_session else "share_console"
+        if alt_session:
+            mode = "alt_session"
+        elif share_without_asking:
+            mode = "share_console_no_ask"
+        else:
+            mode = "share_console"
         _phase_session_select(
             sock,
             mode=mode,

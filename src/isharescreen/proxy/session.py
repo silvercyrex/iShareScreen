@@ -247,6 +247,13 @@ class SessionConfig:
     # screen). Mutually exclusive with `share_console`.
     alt_session: bool = False
 
+    # HPG fork: with share_console (or the auto-default), share the console
+    # user's screen WITHOUT the permission popup (SessionSelect cmd=1). Needs
+    # an account with Remote Management rights; macOS shows its own
+    # "being observed" notice. No effect when the auth user is the console
+    # user (no SessionSelect prompt) or with alt_session.
+    share_without_asking: bool = False
+
     # Optional callback () -> "share_console" | "alt_session". Invoked during
     # negotiation when a different user is at the console and neither flag was
     # forced — lets a launcher (the GUI) prompt the user at connect time.
@@ -1407,6 +1414,7 @@ class Session:
             video_offer=video_offer,
             share_console=cfg.share_console,
             alt_session=cfg.alt_session,
+            share_without_asking=cfg.share_without_asking,
             on_session_choice=cfg.on_session_choice,
             recorder=self._recorder,
         )

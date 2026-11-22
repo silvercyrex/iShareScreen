@@ -223,6 +223,15 @@ def _make_parser() -> argparse.ArgumentParser:
             "with --share-console."
         ),
     )
+    g.add_argument(
+        "--share-without-asking", action="store_true",
+        help=(
+            "when sharing the logged-in user's session, skip the permission "
+            "popup (Apple's SessionSelect cmd=1). Needs an account with Remote "
+            "Management rights on the Mac; macOS shows the user its own "
+            "'being observed' notice. Ignored with --alt-session."
+        ),
+    )
 
     g = p.add_argument_group("audio")
     g.add_argument(
@@ -410,6 +419,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         curtain=args.curtain,
         audio=args.audio,
         share_console=args.share_console, alt_session=args.alt_session,
+        share_without_asking=args.share_without_asking,
         on_session_choice=_ask_session_choice if os.environ.get("ISS_SESSION_CHOICE_URL") else None,
         control_socket=args.control_socket,
         record_pcap=args.record,

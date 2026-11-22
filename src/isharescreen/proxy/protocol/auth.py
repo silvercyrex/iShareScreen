@@ -8,7 +8,8 @@ stream cipher that follows.
 The SRP variant is the modern path used by macOS 15+. Verifier lookup is
 keyed on the username embedded in the RSA-encrypted modulus slot. The
 non-SRP path (auth type 0x21, the asyncvnc-style RSA1 challenge) works
-against every shipping macOS we've tested and is used as fallback.
+against every shipping macOS we've tested. HPG fork: it is no longer an
+automatic fallback; it runs only when asked for (`--auth nonsrp`).
 
 Internals are decomposed into named phases per protocol step. Both
 `do_srp_auth` and `do_nonsrp_auth` are thin orchestrators.
