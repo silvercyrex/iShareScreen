@@ -1817,6 +1817,7 @@ class Session:
         self._server_sr = {}
         self._runtime_canvas_w = 0
         self._runtime_canvas_h = 0
+        self._media_init_seen = 0
         self._runtime_scaled_w = 0
         self._runtime_scaled_h = 0
         # Per-display rectangles within the combined backing canvas, parsed
@@ -3480,6 +3481,8 @@ class Session:
                 if offset + 2 + sz > len(msg):
                     return
                 offset += 2 + sz
+                if encoding == 0x3f2:
+                    self._on_media_stream_reinit()
             elif encoding == 0x451:
                 # AppleDisplayLayout: server confirms/announces display
                 # geometry. Payload is a u16 prefix_length followed by
@@ -3671,6 +3674,27 @@ class Session:
             except Exception:
                 pass
 
+    def _on_media_stream_reinit(self) -> None:
+        """HPG fork: the Mac announces RFBMediaStreamMessage1 (0x3f2) once its
+        media streams were torn down and set up again mid-session: a fast user
+        switch at the login window moves the session to a new agent
+        ("reinitialize the media streams" in screensharingd's log). It then
+        sends no video or audio until the viewer offers the media session
+        again; nothing else does that here when the canvas size is unchanged,
+        so the picture froze until a reconnect. Re-offer (0x1c, same keys) and
+        ask for a keyframe. The first 0x3f2 of a connection is part of setup
+        and is left alone."""
+        self._media_init_seen = getattr(self, "_media_init_seen", 0) + 1
+        if self._media_init_seen < 2:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_last_reoffer_t", 0.0) < 2.0:
+            return
+        log.info("Mac re-initialised its media streams (0x3f2); offering the media session again")
+        self._last_ctrl_event = ("media streams re-initialised", now)
+        self._send_cursor_rearm()
+        self._schedule_post_layout_arm()
+
     def _schedule_post_layout_arm(self) -> None:
         """Called from the 0x451 handler on a geometry CHANGE. Re-offers the
         media session (0x1c) with the same SRTP keys so the server restarts
@@ -3703,6 +3727,7 @@ class Session:
                 alt_session=self._config.alt_session,
             )
             neg.cipher.encrypt_and_send(neg.sock, msg_1c)
+            self._last_reoffer_t = time.monotonic()
             log.info("post-layout: sent 0x1c re-offer (%dB)", len(msg_1c))
         except OSError as e:
             log.warning("post-layout 0x1c send failed: %s", e)
@@ -4477,7 +4502,7 @@ class Session:
         return d[reason]
 
     def _report_video_stall(self) -> None:
-        """HPG fork: while no video has been forwarded for over 5 s, log every
+        """HPG fork: while no video has been forwarded for over 10 s, log every
         10 s where it stops: UDP packets in, SRTP decrypt ok/failed, access
         units dropped by reason, the SSRCs seen, and the control channel's last
         message and event. A still screen shows udp 0 with the RFB channel
@@ -4487,7 +4512,7 @@ class Session:
             return
         now = time.monotonic()
         gap = now - self._last_publish_t
-        if gap < 5.0:
+        if gap < 10.0:
             if self._stall_reported:
                 log.info("video stall: frames flowing again")
                 self._stall_reported = False

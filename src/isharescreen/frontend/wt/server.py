@@ -1005,6 +1005,12 @@ class WebTransportBridge:
                         stats["rcvbuf_errors"] = cur - rcvbuf_base
                 with self._viewers_lock:
                     targets = list(self.viewers)
+                # HPG fork: the Mac dropped the connection under us (a
+                # Remote Management settings change does that); connect again
+                # instead of showing the last picture forever.
+                if (sess is not None and not sess.is_connected and targets
+                        and not getattr(self, "_reconnect_pending", False)):
+                    self._on_mac_connection_lost()
                 # HPG fork: tell the Mac what the slowest viewer can take.
                 self._update_rctl_cap(targets)
                 stats["bwe_kbps"] = getattr(self._session, "rctl_bwe_kbps", 0) \
@@ -2012,30 +2018,7 @@ class WebTransportBridge:
             # Schedule the hot-reconnect on the asyncio loop. Use a
             # one-shot guard so concurrent set_resolution events
             # collapse into a single restart cycle.
-            if getattr(self, "_reconnect_pending", False):
-                return
-            self._reconnect_pending = True
-            def _do_reconnect():
-                try:
-                    self._teardown_session()
-                    # Wait briefly for teardown to settle before fresh start.
-                    time.sleep(0.5)
-                    with self._viewers_lock:
-                        should_start = (
-                            self._session is None
-                            and not self._session_starting
-                            and bool(self.viewers)
-                        )
-                        if should_start:
-                            self._session_starting = True
-                    if should_start:
-                        self._start_session_thread()
-                finally:
-                    self._reconnect_pending = False
-            threading.Thread(
-                target=_do_reconnect,
-                name="wt-session-resreconnect", daemon=True,
-            ).start()
+            self._restart_session("wt-session-resreconnect")
             return
         if self._session is None:
             return
@@ -2058,6 +2041,49 @@ class WebTransportBridge:
                 self._handle_resize(int(msg["w"]), int(msg["h"]))
         except Exception as e:
             log.debug("input dispatch error: %s", e)
+
+    def _restart_session(self, thread_name: str) -> None:
+        """Tear the Mac session down and start a fresh one for the viewers
+        still here, off the event loop. Concurrent requests collapse into one
+        restart cycle."""
+        if getattr(self, "_reconnect_pending", False):
+            return
+        self._reconnect_pending = True
+
+        def _do_reconnect():
+            try:
+                self._teardown_session()
+                # Wait briefly for teardown to settle before fresh start.
+                time.sleep(0.5)
+                with self._viewers_lock:
+                    should_start = (
+                        self._session is None
+                        and not self._session_starting
+                        and bool(self.viewers)
+                    )
+                    if should_start:
+                        self._session_starting = True
+                if should_start:
+                    self._start_session_thread()
+            finally:
+                self._reconnect_pending = False
+        threading.Thread(target=_do_reconnect, name=thread_name, daemon=True).start()
+
+    def _on_mac_connection_lost(self) -> None:
+        """HPG fork: the Mac closed the RFB connection while viewers watch
+        (screensharingd drops its viewers when the Screen Sharing / Remote
+        Management settings change). Connect again with the same login; a Mac
+        that closes it more than 3 times in 2 minutes ends the bridge instead."""
+        now = time.monotonic()
+        lost = [t for t in getattr(self, "_mac_lost_t", []) if now - t < 120.0]
+        lost.append(now)
+        self._mac_lost_t = lost
+        if len(lost) > 3:
+            log.error("the Mac keeps closing the screen sharing connection; ending")
+            self.stop("the Mac closed the screen sharing connection", exit_code=1)
+            return
+        log.warning("the Mac closed the screen sharing connection; connecting again")
+        self._restart_session("wt-session-macreconnect")
 
     def _display_scale(self) -> float:
         """Numeric display scale from --hidpi: auto/on → 2×, off → 1×, or a
