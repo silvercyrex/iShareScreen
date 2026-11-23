@@ -223,6 +223,8 @@ _FORCE_KEYFRAME_ON_JOIN = True
 _AUTH_TIMEOUT_S = 5.0          # a viewer must send its ticket within this
 _MAX_PENDING = 8               # unauthenticated WebTransport sessions at once
 _MAX_SESSION_ATTEMPTS = 3      # Mac session start tries (never on bad login)
+_CLIPBOARD_MAX_CHARS = 256 * 1024   # HPG fork: clipboard text either way
+_INPUT_BUFFER_MAX = 8 * 1024 * 1024  # HPG fork: one viewer's unfinished input line
 
 
 class _ViewerSession:
@@ -553,6 +555,12 @@ class _ViewerSession:
             if self.close_cb is not None:
                 self.close_cb()
             return
+        if len(self.input_buffer) > _INPUT_BUFFER_MAX:
+            # HPG fork: room for one clipboard line, not for an endless one.
+            log.warning("viewer %d sent an input line over %d bytes; dropped",
+                        self.session_id, _INPUT_BUFFER_MAX)
+            self.input_buffer.clear()
+            return
         while True:
             nl = self.input_buffer.find(b"\n")
             if nl < 0:
@@ -564,7 +572,8 @@ class _ViewerSession:
             try:
                 msg = json.loads(line)
             except Exception as e:
-                log.warning("bad input json: %s — %s", e, line[:80])
+                # HPG fork: length only; a line can carry clipboard text.
+                log.warning("bad input json (%d bytes): %s", len(line), e)
                 continue
             if not isinstance(msg, dict):
                 continue
@@ -801,10 +810,15 @@ class WebTransportBridge:
         password_from_page: bool = False,
         mac_name: str = "",
         exit_on_stdin_close: bool = False,
+        clipboard: bool = False,
     ) -> None:
         # HPG fork: this frontend forwards the Mac's H.264 to the browsers and
         # never uses iss's own decode, so the session skips decoding the burst.
-        self._config = dataclasses.replace(config, video_passthrough=True)
+        # HPG fork: --clipboard text swaps clipboard text between the Mac and
+        # the controlling viewer's browser (never for view-only).
+        self._clipboard = bool(clipboard) and not view_only
+        self._config = dataclasses.replace(config, video_passthrough=True,
+                                           clipboard_sync=self._clipboard)
         self._port = port
         # HPG fork: listen only where told (upstream: every interface).
         self._bind = bind
@@ -1219,7 +1233,8 @@ class WebTransportBridge:
         if self._owner is None and not adm.is_joiner:
             self._owner = viewer
         viewer.send_control({"type": "auth_ok", "read_only": ro,
-                             "source_url": self.source_url})
+                             "source_url": self.source_url,
+                             "clipboard": self._clipboard and not ro})
         self._events.emit("viewer_joined", user=adm.user, sid=adm.sid,
                           read_only=ro, viewers=len(self.viewers) + 1)
         self._events.user_connected(adm.user)
@@ -1474,6 +1489,8 @@ class WebTransportBridge:
             # cursor is NOT baked into the framebuffer, so moving the mouse
             # doesn't dirty the frame / wake the encoder.
             session.set_cursor_callback(self._on_cursor)
+            if self._clipboard:
+                session.set_clipboard_text_callback(self._on_mac_clipboard)
             # Audio: opus encoder + callback hook. Audio runs on its
             # own thread (the session's audio RX thread). Each Opus
             # packet is sent as a WebTransport DATAGRAM (RFC 9297) —
@@ -1768,6 +1785,10 @@ class WebTransportBridge:
                 self._session.set_cursor_callback(None)
             except Exception:
                 pass
+            try:
+                self._session.set_clipboard_text_callback(None)
+            except Exception:
+                pass
         if self._audio_enc is not None:
             self._audio_enc.close()
             self._audio_enc = None
@@ -2039,8 +2060,44 @@ class WebTransportBridge:
                 )
             elif kind == "resize":
                 self._handle_resize(int(msg["w"]), int(msg["h"]))
+            elif kind == "clipboard":
+                self._clipboard_to_mac(msg.get("text"))
         except Exception as e:
             log.debug("input dispatch error: %s", e)
+
+    # HPG fork: clipboard text between the Mac and the controlling viewer.
+    # Lengths are logged, never the text.
+    def _clipboard_to_mac(self, text) -> None:
+        if not self._clipboard or self._session is None:
+            return
+        if not isinstance(text, str) or not text:
+            return
+        if len(text) > _CLIPBOARD_MAX_CHARS:
+            log.info("clipboard to Mac: %d chars, over the %d limit; not sent",
+                     len(text), _CLIPBOARD_MAX_CHARS)
+            return
+        self._clip_to_mac = text
+        self._session.input.cut_text(text)
+        log.info("clipboard to Mac: %d chars", len(text))
+
+    def _on_mac_clipboard(self, text: str) -> None:
+        """Session TCP thread: text was copied on the Mac."""
+        if not text or text == getattr(self, "_clip_to_mac", None):
+            return   # empty, or our own paste coming back from the Mac
+        if len(text) > _CLIPBOARD_MAX_CHARS:
+            log.info("clipboard from Mac: %d chars, over the %d limit; not sent",
+                     len(text), _CLIPBOARD_MAX_CHARS)
+            return
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(self._clipboard_to_viewer, text)
+
+    def _clipboard_to_viewer(self, text: str) -> None:
+        v = self._controller
+        if v is None or v not in self.viewers or v.read_only:
+            return
+        v.send_control({"type": "clipboard", "text": text})
+        log.info("clipboard from Mac: %d chars to viewer %d", len(text), v.session_id)
 
     def _restart_session(self, thread_name: str) -> None:
         """Tear the Mac session down and start a fresh one for the viewers

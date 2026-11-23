@@ -195,6 +195,28 @@ helping a person in their own session, and IT working in a separate session.
   default: in the lab (macOS 27, H.264) the Mac ignored it, sending 43-63
   Mbit/s while asked for 4-5.
 
+**Clipboard (browser, optional)**
+- `--clipboard text` swaps clipboard text between the Mac and the
+  controlling viewer's browser. Pressing Ctrl/Cmd+V in the viewer sends this
+  computer's clipboard text to the Mac first, then the key, so the Mac pastes
+  it (the browser hands the text over in its paste event, no permission
+  prompt). Text copied on the Mac goes to this computer's clipboard; when the
+  browser refuses that without a click, a "Copied on the Mac" button appears.
+  Off by default; never for view-only viewers; up to 256 K characters; logs
+  hold lengths only. Only changes made during the session pass: connecting
+  does not hand over what was copied on the Mac before. Text only for now.
+
+**Freezes after the Mac restarts its media**
+- A user switch at the login window or a display sleep makes the Mac
+  re-initialise its media streams (it says so with RFBMediaStreamMessage1,
+  0x3f2) and wait for the viewer to offer the media session again; iss now
+  does that instead of freezing.
+- A Screen Sharing or Remote Management settings change makes the Mac close
+  its viewers; the bridge now connects again with the same login (and ends
+  after more than 3 drops in 2 minutes).
+- While nothing is forwarded for over 10 s, the log says where video stops
+  ("video stall …": UDP packets in, decrypt ok/failed, drops by reason).
+
 **Settings (environment)**
 - `ISS_UDP_RCVBUF` (bytes, default 8 MB), `ISS_WT_MAX_BEHIND_MS` (500),
   `ISS_WT_RESUME_BEHIND_MS` (150), `ISS_WT_KEYFRAME_RETRY_MS` (1500),

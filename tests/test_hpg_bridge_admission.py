@@ -154,7 +154,8 @@ def test_valid_ticket_starts_session(bridge):
     v = _V(1)
     _auth(bridge, v)
     assert bridge.viewers == [v] and bridge._started
-    assert v.sent[-1] == {"type": "auth_ok", "read_only": False, "source_url": ""}
+    assert v.sent[-1] == {"type": "auth_ok", "read_only": False, "source_url": "",
+                         "clipboard": False}
 
 
 def test_one_controller_second_is_view_only(bridge):

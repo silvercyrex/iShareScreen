@@ -159,6 +159,12 @@ def _make_parser() -> argparse.ArgumentParser:
         "Mac (browser: every viewer is view-only; desktop: the window too)",
     )
     g.add_argument(
+        "--clipboard", choices=("off", "text"), default="off",
+        help="browser: swap clipboard text between the Mac and the controlling "
+        "viewer's browser (paste into the viewer sends it, copying on the Mac "
+        "brings it back); never for view-only (default off)",
+    )
+    g.add_argument(
         "--ask-password", action="store_true",
         help="desktop viewer: ask for the Mac password in a small window, "
         "connect from there (3 tries), then open the video window",
@@ -675,6 +681,7 @@ def _run_frontend(config: SessionConfig, args: argparse.Namespace) -> int:
         exit_on_stdin_close=args.exit_on_stdin_close,
         password_from_page=args.app and not config.password,
         mac_name=args.connection_name or args.host or config.host,
+        clipboard=args.clipboard == "text",
     )
 
 

@@ -359,6 +359,11 @@ class SessionConfig:
     # HPG fork: watch only. Session.input then drops every pointer, key,
     # scroll and clipboard call, whichever frontend makes it.
     view_only: bool = False
+    # HPG fork: exchange clipboard text with the frontend (the browser page),
+    # not with the OS clipboard of the machine running iss. Mac -> frontend
+    # through set_clipboard_text_callback, frontend -> Mac through
+    # input.cut_text. Off unless asked for; never while view-only.
+    clipboard_sync: bool = False
 
     # Local control socket: when set, the Session opens a ControlServer at
     # this path (UDS on POSIX, sidecar `.port` file on Windows) so an
@@ -1421,10 +1426,15 @@ class Session:
         # clipboard with the current host contents (msg 0x0b). HPG fork: off
         # unless ISS_CLIP=1 (upstream default was on; it syncs the Mac with the
         # machine running iss — on a gateway, that is the gateway).
-        if os.environ.get("ISS_CLIP", "0") == "1" and not self._config.view_only:
+        # With clipboard_sync (the browser page) only changes made from now
+        # on are passed on: no prime, so connecting does not hand the viewer
+        # whatever was copied on the Mac before.
+        os_clip = os.environ.get("ISS_CLIP", "0") == "1"
+        if (os_clip or self._config.clipboard_sync) and not self._config.view_only:
             try:
                 self._input.send_clipboard_enable()
-                self._input.send_clipboard_fetch()
+                if os_clip:
+                    self._input.send_clipboard_fetch()
             except Exception as e:  # pragma: no cover
                 log.debug("clipboard enable/prime failed: %s", e)
         self._clipboard_reassembler = self._clipboard_reassembler.__class__()
@@ -3920,7 +3930,10 @@ class Session:
             len(items), len(text),
         )
         self._last_received_clipboard_text = text
-        local_clipboard.push_text(text)
+        if os.environ.get("ISS_CLIP", "0") == "1":
+            # HPG fork: only the OS-clipboard mode writes the clipboard of the
+            # machine running iss (on a gateway that is the gateway's).
+            local_clipboard.push_text(text)
         cb = self._clipboard_text_callback
         if cb is not None:
             try:
