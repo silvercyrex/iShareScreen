@@ -1,38 +1,77 @@
-"""HPG fork: the bridge connects again when the Mac drops the RFB connection
-(a Remote Management settings change made screensharingd close it and the
-picture froze until the viewer reconnected)."""
+"""HPG fork: when the Mac drops the RFB connection the bridge tells the
+viewers and waits for the controlling viewer to reconnect (a Remote
+Management settings change does that, but so does the person at the Mac
+ending the sharing, and the bridge cannot tell which)."""
 from __future__ import annotations
 
 from isharescreen.frontend.wt.server import WebTransportBridge
 
 
+class _Viewer:
+    def __init__(self):
+        self.controls = []
+
+    def send_control(self, obj):
+        self.controls.append(obj)
+
+
+class _Handle:
+    def __init__(self, fn):
+        self.fn, self.cancelled = fn, False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class _Loop:
+    def __init__(self):
+        self.later = []
+
+    def call_later(self, delay, fn, *args):
+        h = _Handle(fn)
+        self.later.append((delay, h))
+        return h
+
+
 def _bridge(monkeypatch):
     b = WebTransportBridge.__new__(WebTransportBridge)
     calls = []
+    monkeypatch.setattr(b, "_teardown_session", lambda: calls.append("teardown"))
     monkeypatch.setattr(b, "_restart_session", lambda name: calls.append(("restart", name)))
     monkeypatch.setattr(b, "stop", lambda reason, exit_code=0: calls.append(("stop", exit_code)))
-    clock = [1000.0]
-    monkeypatch.setattr("isharescreen.frontend.wt.server.time.monotonic", lambda: clock[0])
-    return b, calls, clock
+    b._loop = _Loop()
+    b.viewers = [_Viewer()]
+    return b, calls
 
 
-def test_reconnects_when_the_mac_closes_the_connection(monkeypatch):
-    b, calls, _ = _bridge(monkeypatch)
+def test_viewers_are_told_and_nothing_logs_in_again_by_itself(monkeypatch):
+    b, calls = _bridge(monkeypatch)
     b._on_mac_connection_lost()
-    assert calls == [("restart", "wt-session-macreconnect")]
+    assert b.viewers[0].controls == [{"type": "mac_lost"}]
+    assert not any(isinstance(c, tuple) and c[0] == "restart" for c in calls)
+    assert b._mac_lost
 
 
-def test_gives_up_when_the_mac_keeps_closing_it(monkeypatch):
-    b, calls, clock = _bridge(monkeypatch)
-    for i in range(4):
-        clock[0] = 1000.0 + 10 * i
-        b._on_mac_connection_lost()
-    assert [c[0] for c in calls] == ["restart", "restart", "restart", "stop"]
+def test_the_viewer_reconnects_with_one_request(monkeypatch):
+    b, calls = _bridge(monkeypatch)
+    b._on_mac_connection_lost()
+    b._reconnect_after_mac_lost()
+    assert ("restart", "wt-session-macreconnect") in calls
+    assert b._loop.later[0][1].cancelled and not b._mac_lost
+    b._reconnect_after_mac_lost()                 # a second click does nothing
+    assert calls.count(("restart", "wt-session-macreconnect")) == 1
 
 
-def test_old_losses_are_forgotten(monkeypatch):
-    b, calls, clock = _bridge(monkeypatch)
-    for i in range(4):
-        clock[0] = 1000.0 + 100 * i
-        b._on_mac_connection_lost()
-    assert [c[0] for c in calls] == ["restart"] * 4
+def test_nobody_reconnecting_ends_the_bridge(monkeypatch):
+    b, calls = _bridge(monkeypatch)
+    b._on_mac_connection_lost()
+    delay, handle = b._loop.later[0]
+    assert delay == 600.0
+    handle.fn()
+    assert ("stop", 1) in calls
+
+
+def test_reconnect_without_a_lost_connection_is_ignored(monkeypatch):
+    b, calls = _bridge(monkeypatch)
+    b._reconnect_after_mac_lost()
+    assert calls == []

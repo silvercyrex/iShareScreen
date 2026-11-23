@@ -106,6 +106,9 @@
   #src-link { flex: 0 0 auto; color: #9cc8ff; text-decoration: none; white-space: nowrap; }
   /* HPG fork: text copied on the Mac that the browser would not take
      without a click. */
+  #reconnect-btn { flex: 0 0 auto; background: rgba(220,80,40,.9); color: #fff;
+    border: 1px solid rgba(255,140,100,.6); border-radius: 4px; cursor: pointer;
+    height: 26px; padding: 0 10px; font: inherit; white-space: nowrap; }
   #clip-btn {
     flex: 0 0 auto; display: none; background: rgba(40,140,240,.85); color: #fff;
     border: 1px solid rgba(90,170,255,.6); border-radius: 4px; cursor: pointer;
@@ -200,6 +203,7 @@
   <button id="unmute" title="Toggle audio">🔇</button>
   <button id="fs-btn" title="Fullscreen (auto-hides this bar)">⛶</button>
   <span id="ro-badge" title="You can watch but not control this screen" style="display:none">View only</span>
+  <button id="reconnect-btn" style="display:none" title="The Mac closed the screen sharing connection; connect again with the same login">↻ Reconnect</button>
   <button id="clip-btn" title="Text was copied on the Mac; click to put it on this computer's clipboard">📋 Copied on the Mac: click to copy</button>
   <a id="src-link" target="_blank" rel="noopener noreferrer"
      title="This viewer is free software (AGPL-3.0): get its source code">Source code</a>
@@ -891,8 +895,31 @@ async function main() {
   // HPG fork: clipboard text with the Mac (bridge --clipboard text, controller only).
   let clipOn = false;
   let pendingPasteKs = 0;   // the V of Ctrl/Cmd+V, held until the paste event
+  // HPG fork: on a Windows/Linux computer, Ctrl+A/C/V/X/Z reach the Mac as
+  // Cmd+A/C/V/X/Z (select all, copy, paste, cut, undo), which is what Mac apps
+  // expect. Other Ctrl combinations stay Ctrl. ?ctrl=ctrl in the page URL
+  // turns this off; a Mac computer never needs it.
+  const CMD_KS = 0xffeb, CTRL_KS = 0xffe3;
+  const CMD_LETTERS = new Set(["a", "c", "v", "x", "z"]);
+  const ctrlAsCmd = !/Mac|iPhone|iPad/i.test(
+      (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "")
+    && new URLSearchParams(location.search).get("ctrl") !== "ctrl";
+  // Physical key (e.code) -> the keysym sent down with Cmd instead of Ctrl.
+  // Keyed by the key, not the keysym: Shift let go first makes the keyup's
+  // letter lower case, and Cmd must still come up.
+  const asCmd = new Map();
+  const CLIP_MAX = 256 * 1024;   // the bridge's limit, in characters
   let macClipText = null;   // copied on the Mac, not yet on this clipboard
   const clipBtn = document.getElementById("clip-btn");
+  const reconnectBtn = document.getElementById("reconnect-btn");
+  let macLost = false;
+  reconnectBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    reconnectBtn.style.display = "none";
+    macLost = false;
+    setStatus("connecting to the Mac again…", "ok");
+    send({type: "reconnect"});
+  });
   await inputWriter.write(enc.encode(JSON.stringify(boot.auth) + "\n"));
   boot.auth = null;
   __logSink = (rec) => send(rec);
@@ -925,6 +952,12 @@ async function main() {
           setStatus(`session ended: ${m.reason || ""}`, "err");
         } else if (m.type === "need_password") {
           showPasswordBox(m);
+        } else if (m.type === "mac_lost") {
+          // HPG fork: the Mac closed the connection (a settings change, or
+          // the person at the Mac ended the sharing). The controller decides.
+          macLost = true;
+          setStatus("the Mac closed the screen sharing connection", "err");
+          reconnectBtn.style.display = readOnly ? "none" : "";
         } else if (m.type === "clipboard" && clipOn && typeof m.text === "string") {
           macClipText = m.text;
           copyMacClip();
@@ -1231,17 +1264,46 @@ async function main() {
     return clipOn && !e.altKey && (e.ctrlKey || e.metaKey)
       && (e.key === "v" || e.key === "V");
   }
+  function isCmdShortcut(e) {
+    return ctrlAsCmd && e.ctrlKey && !e.altKey && !e.metaKey
+      && CMD_LETTERS.has((e.key || "").toLowerCase());
+  }
+  // The letter goes down as Cmd+letter: let go of Ctrl on the Mac first.
+  function letterDown(ks, viaCmd, code) {
+    if (viaCmd && !asCmd.has(code)) {
+      send({type: "key", down: false, keysym: CTRL_KS});
+      send({type: "key", down: true, keysym: CMD_KS});
+      asCmd.set(code, ks);
+    }
+    send({type: "key", down: true, keysym: ks});
+    latch.realKeyDown(ks);
+  }
+  // Leaving the window mid-shortcut must not leave Cmd held on the Mac.
+  window.addEventListener("blur", () => {
+    pendingPasteKs = 0;
+    if (!asCmd.size) return;
+    for (const ks of asCmd.values()) send({type: "key", down: false, keysym: ks});
+    asCmd.clear();
+    send({type: "key", down: false, keysym: CMD_KS});
+  });
+  let pendingPasteCmd = false, pendingPasteCode = "";
   function releasePendingPaste() {
     if (!pendingPasteKs) return;
     const ks = pendingPasteKs;
     pendingPasteKs = 0;
-    send({type: "key", down: true, keysym: ks});
-    latch.realKeyDown(ks);
+    letterDown(ks, pendingPasteCmd, pendingPasteCode);
   }
   document.addEventListener("paste", (e) => {
     if (!clipOn || pwBox.contains(e.target)) return;
     e.preventDefault();
     const text = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
+    if (text.length > CLIP_MAX) {
+      // Not sent: and no V either, or the Mac would paste its old text.
+      pendingPasteKs = 0;
+      setStatus(`clipboard too long to send (${text.length} characters, `
+                + `at most ${CLIP_MAX})`, "err");
+      return;
+    }
     if (text) send({type: "clipboard", text});
     releasePendingPaste();
   });
@@ -1253,19 +1315,30 @@ async function main() {
       // Leave the default alone: it fires the paste event, which sends the
       // text and then this V. If no paste event comes, the keyup sends it.
       const ks = keysymFromEvent(e);
-      if (ks) { pendingPasteKs = ks; return; }
+      if (ks) {
+        pendingPasteKs = ks; pendingPasteCmd = isCmdShortcut(e); pendingPasteCode = e.code;
+        return;
+      }
     }
     e.preventDefault();
     const ks = keysymFromEvent(e);
-    if (ks) {
-      send({type: "key", down: true, keysym: ks});
-      latch.realKeyDown(ks);
-    }
+    if (ks) letterDown(ks, isCmdShortcut(e), e.code);
   });
   document.addEventListener("keyup", (e) => {
     if (pwBox.contains(e.target)) return;
     e.preventDefault();
     releasePendingPaste();   // HPG fork: no paste event came; send the V now
+    const held = asCmd.get(e.code);
+    if (held !== undefined) {
+      // HPG fork: end the Cmd+letter (the keysym it went down with); Ctrl
+      // goes back down if still held.
+      asCmd.delete(e.code);
+      send({type: "key", down: false, keysym: held});
+      latch.realKeyUp(held);
+      send({type: "key", down: false, keysym: CMD_KS});
+      if (e.ctrlKey) send({type: "key", down: true, keysym: CTRL_KS});
+      return;
+    }
     const ks = keysymFromEvent(e);
     if (ks) {
       send({type: "key", down: false, keysym: ks});
@@ -1305,7 +1378,7 @@ async function main() {
     // not changing (a login window), which is not a fault. Only a viewer that
     // is waiting for a resync keyframe is shown as a problem.
     const catchingUp = !!serverStats.resyncing;
-    const klass = catchingUp ? "err" : "ok";
+    const klass = catchingUp || macLost ? "err" : "ok";
     setStatus(
       `${dFps.toFixed(0)} fps · ${mbps.toFixed(2)} Mb/s · ${canvas.width}×${canvas.height}`
       + ` · loss ${loss.toFixed(2)}%`
@@ -1313,7 +1386,8 @@ async function main() {
       // too slow / frame lost), and kernel buffer drops on the bridge.
       + (serverStats.frames_dropped ? ` · skipped ${serverStats.frames_dropped}` : "")
       + (serverStats.rcvbuf_errors ? ` · buffer drops ${serverStats.rcvbuf_errors}` : "")
-      + (catchingUp ? " · ⚠ catching up"
+      + (macLost ? " · ⚠ the Mac closed the connection"
+         : catchingUp ? " · ⚠ catching up"
          : stuck >= 1.5 ? ` · no change ${stuck.toFixed(0)}s` : "")
       + ` · ${serverStats.decoder || "?"}/${serverStats.encoder || "?"}`,
       klass,

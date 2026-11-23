@@ -225,6 +225,7 @@ _MAX_PENDING = 8               # unauthenticated WebTransport sessions at once
 _MAX_SESSION_ATTEMPTS = 3      # Mac session start tries (never on bad login)
 _CLIPBOARD_MAX_CHARS = 256 * 1024   # HPG fork: clipboard text either way
 _INPUT_BUFFER_MAX = 8 * 1024 * 1024  # HPG fork: one viewer's unfinished input line
+_MAC_LOST_WAIT_S = 600.0            # HPG fork: wait this long for "reconnect"
 
 
 class _ViewerSession:
@@ -1020,10 +1021,12 @@ class WebTransportBridge:
                 with self._viewers_lock:
                     targets = list(self.viewers)
                 # HPG fork: the Mac dropped the connection under us (a
-                # Remote Management settings change does that); connect again
-                # instead of showing the last picture forever.
+                # Remote Management settings change does that, and so does
+                # the person at the Mac ending the sharing); say so instead of
+                # showing the last picture forever.
                 if (sess is not None and not sess.is_connected and targets
-                        and not getattr(self, "_reconnect_pending", False)):
+                        and not getattr(self, "_reconnect_pending", False)
+                        and not getattr(self, "_mac_lost", False)):
                     self._on_mac_connection_lost()
                 # HPG fork: tell the Mac what the slowest viewer can take.
                 self._update_rctl_cap(targets)
@@ -2041,6 +2044,9 @@ class WebTransportBridge:
             # collapse into a single restart cycle.
             self._restart_session("wt-session-resreconnect")
             return
+        if kind == "reconnect":
+            self._reconnect_after_mac_lost()
+            return
         if self._session is None:
             return
         try:
@@ -2090,7 +2096,20 @@ class WebTransportBridge:
             return
         loop = self._loop
         if loop is not None:
-            loop.call_soon_threadsafe(self._clipboard_to_viewer, text)
+            loop.call_soon_threadsafe(self._queue_clipboard_to_viewer, text)
+
+    def _queue_clipboard_to_viewer(self, text: str) -> None:
+        # Coalesce: a Mac rewriting its clipboard in a loop sends the viewer
+        # only the newest text, a few times a second at most.
+        self._clip_to_viewer = text
+        if getattr(self, "_clip_handle", None) is None:
+            self._clip_handle = self._loop.call_later(0.3, self._flush_clipboard_to_viewer)
+
+    def _flush_clipboard_to_viewer(self) -> None:
+        self._clip_handle = None
+        text, self._clip_to_viewer = getattr(self, "_clip_to_viewer", None), None
+        if text:
+            self._clipboard_to_viewer(text)
 
     def _clipboard_to_viewer(self, text: str) -> None:
         v = self._controller
@@ -2127,19 +2146,36 @@ class WebTransportBridge:
         threading.Thread(target=_do_reconnect, name=thread_name, daemon=True).start()
 
     def _on_mac_connection_lost(self) -> None:
-        """HPG fork: the Mac closed the RFB connection while viewers watch
-        (screensharingd drops its viewers when the Screen Sharing / Remote
-        Management settings change). Connect again with the same login; a Mac
-        that closes it more than 3 times in 2 minutes ends the bridge instead."""
-        now = time.monotonic()
-        lost = [t for t in getattr(self, "_mac_lost_t", []) if now - t < 120.0]
-        lost.append(now)
-        self._mac_lost_t = lost
-        if len(lost) > 3:
-            log.error("the Mac keeps closing the screen sharing connection; ending")
+        """HPG fork: the Mac closed the RFB connection while viewers watch.
+        That happens when the Screen Sharing / Remote Management settings
+        change, but also when the person at the Mac ends the sharing, and the
+        bridge cannot tell which, so it does not log in again by itself: the
+        viewers are told, and the controlling viewer can reconnect with one
+        click (the same login). Nobody reconnecting for 10 minutes ends it."""
+        self._mac_lost = True
+        log.warning("the Mac closed the screen sharing connection; waiting for "
+                    "the viewer to reconnect")
+        threading.Thread(target=self._teardown_session,
+                         name="wt-session-lost", daemon=True).start()
+        for v in list(self.viewers):
+            v.send_control({"type": "mac_lost"})
+        loop = self._loop
+        if loop is not None:
+            self._mac_lost_handle = loop.call_later(_MAC_LOST_WAIT_S, self._mac_lost_expired)
+
+    def _mac_lost_expired(self) -> None:
+        if getattr(self, "_mac_lost", False):
             self.stop("the Mac closed the screen sharing connection", exit_code=1)
+
+    def _reconnect_after_mac_lost(self) -> None:
+        if not getattr(self, "_mac_lost", False):
             return
-        log.warning("the Mac closed the screen sharing connection; connecting again")
+        self._mac_lost = False
+        handle = getattr(self, "_mac_lost_handle", None)
+        if handle is not None:
+            handle.cancel()
+            self._mac_lost_handle = None
+        log.info("viewer asked to reconnect to the Mac")
         self._restart_session("wt-session-macreconnect")
 
     def _display_scale(self) -> float:

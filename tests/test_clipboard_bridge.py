@@ -36,6 +36,9 @@ class _Loop:
     def call_soon_threadsafe(self, fn, *args):
         fn(*args)
 
+    def call_later(self, delay, fn, *args):
+        fn(*args)          # run the coalescing flush at once
+
 
 def _bridge(clipboard=True):
     b = WebTransportBridge.__new__(WebTransportBridge)
@@ -83,6 +86,24 @@ def test_mac_text_goes_to_the_controller_only():
     b._controller.read_only = True
     b._on_mac_clipboard("again")
     assert len(b._controller.controls) == 1
+
+
+def test_a_copy_spamming_mac_sends_only_the_newest_text():
+    b = _bridge()
+
+    class _Held(_Loop):
+        def __init__(self):
+            self.pending = []
+
+        def call_later(self, delay, fn, *args):
+            self.pending.append(fn)
+            return object()
+    b._loop = _Held()
+    for i in range(50):
+        b._on_mac_clipboard(f"copy {i}")
+    assert len(b._loop.pending) == 1
+    b._loop.pending[0]()
+    assert b._controller.controls == [{"type": "clipboard", "text": "copy 49"}]
 
 
 def test_our_own_paste_coming_back_is_not_echoed():
