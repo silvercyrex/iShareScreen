@@ -525,6 +525,15 @@ class Session:
         self._cursor_msgs_processed = 0
         self._cursor_last_t: float = 0.0
         self._rx_msg_type_counts: dict[int, int] = {}
+        # HPG fork: why a video stall happens. Where packets and access units
+        # stop (dropped by reason), and the last control-channel event, logged
+        # by _report_video_stall only while nothing is forwarded.
+        self._stall_diag: dict[str, int] = defaultdict(int)
+        self._stall_diag_prev: dict[str, int] = {}
+        self._stall_report_t = 0.0
+        self._stall_reported = False
+        self._last_tcp_rx_t = 0.0
+        self._last_ctrl_event = ("", 0.0)
         # Snapshot baselines for delta computation in _log_profile_snapshot.
         self._last_rx_pkts: tuple[int, int, int] = (0, 0, 0)
         self._last_rx_bytes: tuple[int, int] = (0, 0)
@@ -2529,7 +2538,9 @@ class Session:
 
             res = decryptor.decrypt(pkt)
             if res is None:
+                self._count_stall("decrypt_fail")
                 continue
+            self._count_stall("decrypt_ok")
             hdr, payload = res
             ssrc = struct.unpack(">I", hdr[8:12])[0]
             seq = struct.unpack(">H", hdr[2:4])[0]
@@ -2726,6 +2737,7 @@ class Session:
             marker_map[ssrc] = marker_seqs[-1]
         ti = self._ssrc_to_tile.get(ssrc)
         if ti is None:
+            self._count_stall("drop_unmapped")
             return  # SSRC not part of the subscribed tier
 
         # Sort by seq, wraparound-aware.
@@ -2766,6 +2778,7 @@ class Session:
                 # black/green in both the desktop and browser frontends.
                 # The post-layout FIR makes Apple repeat the config/keyframe;
                 # resume only after _maybe_reharvest_avc_config installs it.
+                self._count_stall("drop_resize_wait")
                 return
         _reassemble = reassemble_h264 if self._video_codec == "avc" else reassemble_group
         au_cb = self._video_au_callback if self._video_codec == "avc" else None
@@ -2787,6 +2800,7 @@ class Session:
                 # `_check_stall` FIR-storms if the param sets are ever
                 # lost), so we resume cleanly once the new SPS/PPS land and
                 # the decoder is rebuilt.
+                self._count_stall("drop_resize_wait")
                 return
             # Harvest just completed inside the call above: `set_params` +
             # `restart` rebuilt the context at the new dimensions, so the
@@ -2798,6 +2812,7 @@ class Session:
             # is re-rooted by the FIR the decoder's missing-ref / wedge
             # path requests once a later complete frame references this
             # dropped one.
+            self._count_stall("drop_incomplete")
             return
 
         # Forward the raw AU to the browser BEFORE decoding it here. The browser
@@ -2818,6 +2833,8 @@ class Session:
             # liveness — the meaningful "stall" for pass-through is AUs no longer
             # arriving, not a local decoder freeze.
             au_parts = [b"\x00\x00\x00\x01" + bytes(n) for n in nalus]
+            if not au_parts:
+                self._count_stall("drop_empty")
             if au_parts:
                 try:
                     self.last_au_rx_t = self._frame_rx_t.pop(key[1], 0.0)
@@ -2835,7 +2852,10 @@ class Session:
                         if ti in gate._keyframe_required and _au_has_keyframe(nalus):
                             gate.mark_keyframe_forwarded(ti)
                 except Exception:
-                    log.debug("video_au_callback raised", exc_info=True)
+                    if self._count_stall("forward_error") == 1:
+                        log.warning("video_au_callback raised", exc_info=True)
+                    else:
+                        log.debug("video_au_callback raised", exc_info=True)
             if _PASSTHROUGH_LOCAL_DECODE:
                 for nalu in nalus:
                     self._decoder.feed_nalu(nalu, ti, donl=donl)
@@ -3314,6 +3334,7 @@ class Session:
         # bugs like "cursor freezes after idle" — if msg type=0x00 stops
         # incrementing during the freeze, the daemon stopped sending.
         self._rx_pkts_tcp += 1
+        self._last_tcp_rx_t = time.monotonic()
         t = msg[0]
         self._rx_msg_type_counts[t] = self._rx_msg_type_counts.get(t, 0) + 1
         # Optional RE hook: dump every inbound RFB msg type + body.
@@ -3350,6 +3371,11 @@ class Session:
             if cmd != self._last_misc_status_cmd:
                 log.debug("server sent 0x14 misc-status (cmd=%s): %s", cmd, msg.hex())
                 self._last_misc_status_cmd = cmd
+            if cmd == 11:
+                # HPG fork: the Mac's user session changed (login window,
+                # user switch). Rare; worth a line next to any stall it causes.
+                log.info("Mac reports a user session change (0x14 cmd=11)")
+                self._last_ctrl_event = ("user session change", time.monotonic())
             if cmd == 2:
                 log.info("remote clipboard changed; sending fetch (0x0b)")
                 try:
@@ -3543,6 +3569,8 @@ class Session:
                             " changed=%s",
                             sw, sh, bw, bh, changed,
                         )
+                        self._last_ctrl_event = (
+                            f"display layout {bw}x{bh} changed={changed}", time.monotonic())
                         # Diagnostic for the "top squished / bottom black"
                         # multi-monitor bug: does the per-display layout cover
                         # the whole backing canvas? If the rects' union is
@@ -3912,6 +3940,7 @@ class Session:
                 self._drain_pending_fir()
                 self._maybe_reanchor_d3d11va_avc()
                 self._check_stall()
+                self._report_video_stall()
                 self._maybe_poll_cursor()
                 if self._tx_tick % _TX_PROFILE_EVERY_N_TICKS == 0:
                     self._log_profile_snapshot()
@@ -4438,6 +4467,66 @@ class Session:
             _AVC_D3D11_REANCHOR_FRAMES,
             sent,
             self.num_tiles,
+        )
+
+    def _count_stall(self, reason: str) -> int:
+        d = self.__dict__.get("_stall_diag")
+        if d is None:
+            d = self._stall_diag = defaultdict(int)
+        d[reason] += 1
+        return d[reason]
+
+    def _report_video_stall(self) -> None:
+        """HPG fork: while no video has been forwarded for over 5 s, log every
+        10 s where it stops: UDP packets in, SRTP decrypt ok/failed, access
+        units dropped by reason, the SSRCs seen, and the control channel's last
+        message and event. A still screen shows udp 0 with the RFB channel
+        alive; a broken stream shows packets that never become frames. Logs
+        once more when video resumes. Counts only, never content."""
+        if not self._connected or self._last_publish_t == 0.0:
+            return
+        now = time.monotonic()
+        gap = now - self._last_publish_t
+        if gap < 5.0:
+            if self._stall_reported:
+                log.info("video stall: frames flowing again")
+                self._stall_reported = False
+            return
+        # every 10 s for the first minute, then once a minute (a still screen
+        # can stay unchanged for hours)
+        if now - self._stall_report_t < (10.0 if gap < 70.0 else 60.0):
+            return
+        diag = dict(self._stall_diag)
+        diag["udp"] = self._rx_pkts_video
+        diag["rfb_msgs"] = self._rx_pkts_tcp
+        prev = self._stall_diag_prev
+        self._stall_diag_prev = diag
+        self._stall_report_t = now
+        if not self._stall_reported:
+            # the first tick only takes the baseline; lines carry deltas
+            self._stall_reported = True
+            return
+
+        def d(k: str) -> int:
+            return diag.get(k, 0) - prev.get(k, 0)
+
+        dec = self._video_decryptor
+        seen = sorted(dec.ssrc_counts) if dec is not None else []
+        mapped = sorted(self._ssrc_to_tile)
+        event, event_t = self._last_ctrl_event
+        log.info(
+            "video stall %.0fs, since the last line: udp +%d, decrypt ok +%d fail +%d,"
+            " dropped: unmapped ssrc +%d, waiting for resize config +%d,"
+            " incomplete +%d, empty +%d, forward error +%d;"
+            " ssrc mapped=%s seen=%s; resize wait=%s; rfb msgs +%d, last %.1fs ago;"
+            " last event: %s",
+            gap, d("udp"), d("decrypt_ok"), d("decrypt_fail"),
+            d("drop_unmapped"), d("drop_resize_wait"), d("drop_incomplete"),
+            d("drop_empty"), d("forward_error"),
+            ",".join(f"{s:#x}" for s in mapped), ",".join(f"{s:#x}" for s in seen),
+            self._avc_needs_reconfig or self._needs_param_harvest,
+            d("rfb_msgs"), now - self._last_tcp_rx_t if self._last_tcp_rx_t else -1.0,
+            f"{event} {now - event_t:.0f}s ago" if event else "none",
         )
 
     def _check_stall(self) -> None:
