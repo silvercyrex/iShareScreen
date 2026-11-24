@@ -777,7 +777,19 @@ async function main() {
       }
       return;
     }
-    if (awaitingKey) return;
+    if (awaitingKey) {
+      // Keep asking while we wait: the one request above can be answered
+      // while the decoder is still behind (that keyframe is then dropped
+      // again), or the keyframe can be lost, and the queue no longer grows
+      // to repeat it. Without this the picture froze until the Mac's next
+      // spontaneous keyframe, which can be minutes away.
+      const now = performance.now();
+      if (now - lastBacklogKfT > 1000) {
+        lastBacklogKfT = now;
+        try { send({ type: "keyframe" }); } catch (e) {}
+      }
+      return;
+    }
     frames++;
     if (PROF) {
       const n = performance.now();
