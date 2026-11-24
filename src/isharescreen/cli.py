@@ -280,6 +280,16 @@ def _make_parser() -> argparse.ArgumentParser:
         ),
     )
     g.add_argument(
+        "--max-bitrate", type=float, default=None, metavar="MBIT",
+        help=(
+            "cap the host's video bitrate, in Mbit/s (e.g. 8). The Mac "
+            "normally adapts between 20 and 60 Mbit/s; a cap lowers that "
+            "ceiling, and a cap below 20 makes it encode at the cap. Use it "
+            "for a slow network or a viewer that can't decode the full rate "
+            "(e.g. software H.264 on an older CPU). Default: no cap"
+        ),
+    )
+    g.add_argument(
         "--list-decoders", action="store_true",
         help=("print the decoder capability matrix (with live availability on "
               "this machine) and exit"),
@@ -457,6 +467,15 @@ def _setup_logging(args: argparse.Namespace) -> None:
 
 # ── config build ─────────────────────────────────────────────────────
 
+def _max_bitrate_kbps(mbit: Optional[float]) -> Optional[int]:
+    """--max-bitrate in Mbit/s → kbit/s; None or 0 means no cap."""
+    if not mbit:
+        return None
+    if mbit < 1 or mbit > 100:
+        raise SystemExit("--max-bitrate must be between 1 and 100 (Mbit/s)")
+    return int(mbit * 1000)
+
+
 def _build_session_config(args: argparse.Namespace) -> SessionConfig:
     """Build a SessionConfig from CLI flags. Requires every input to come
     from a flag (no stdin/terminal prompts) -- this entry point serves
@@ -514,6 +533,7 @@ def _build_session_config(args: argparse.Namespace) -> SessionConfig:
         hidpi=args.hidpi,
         curtain=args.curtain,
         audio=args.audio,
+        max_bitrate_kbps=_max_bitrate_kbps(args.max_bitrate),
         share_console=args.share_console, alt_session=args.alt_session,
         share_without_asking=args.share_without_asking,
         udp_connect=(sys.platform == "linux") if relay
