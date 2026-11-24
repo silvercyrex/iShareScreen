@@ -93,6 +93,14 @@ helping a person in their own session, and IT working in a separate session.
   viewers. An embedding page may send `{type: "iss-keys", action:
   "toggle"|"tap"|"combo"|"clear", keys: [...]}`.
 
+**Alt is Option (Windows and Linux viewers, 2026-11-24)**
+- The PC's Alt keys send the Mac's Option (Meta_L/R; the Mac reads
+  Alt_L/R as Command), in the browser page, the desktop app and the
+  Windows keyboard grab. The Windows key and Ctrl+A/C/V/X/Z stay Command.
+  Mac viewers are unchanged. Leaving the page (Alt+Tab) releases every
+  modifier still held; an Option latched on the key bar stays until its
+  button releases it.
+
 **Session start and busy screens**
 - The bridge no longer decodes the Mac's whole opening burst before showing
   anything: it never uses that decode (the browser decodes), and on
@@ -294,6 +302,10 @@ date. `src/isharescreen/frontend/wt/hpg.py` is new.
   picture on managed Macs avoids it.
 - The viewer's status bar shows "frozen" whenever the Mac's screen is still
   (upstream behaviour): a still screen is not a fault.
+- AltGr characters (e.g. @ or € on European layouts) in the Windows desktop
+  app with the keyboard grab on: Windows sends AltGr as a fake left Ctrl
+  plus right Alt, the grab passes the Ctrl to the Mac, and the character
+  arrives with Ctrl (and now Option) held. Not tested on such a layout.
 
 ## Running it for a launcher (example)
 

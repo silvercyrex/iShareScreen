@@ -1302,7 +1302,9 @@ async function main() {
   const modsDown = new Set();
   window.addEventListener("blur", () => {
     pendingPasteKs = 0;
+    const keep = latch.latched();      // the key bar's latch owns those
     for (const ks of modsDown) {
+      if (keep.includes(ks)) continue;
       send({type: "key", down: false, keysym: ks});
       latch.realKeyUp(ks);
     }
@@ -1369,6 +1371,9 @@ async function main() {
     const ks = keysymFromEvent(e);
     if (ks) {
       modsDown.delete(ks);
+      // A modifier the key bar holds stays down until its button releases
+      // it (physical Alt and the bar's Option are the same key on the Mac).
+      if (latch.latched().includes(ks)) return;
       send({type: "key", down: false, keysym: ks});
       latch.realKeyUp(ks);
     }
