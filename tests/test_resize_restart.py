@@ -38,13 +38,20 @@ def test_no_video_after_a_resize_offers_once(clock):
     assert len(s.offers) == 1                    # once
 
 
-def test_video_after_the_resize_needs_nothing(clock):
+def test_video_flowing_at_the_check_needs_nothing(clock):
     s = _session(clock)
-    clock["now"] += 0.5
-    s._last_video_pkt_t = clock["now"]
-    clock["now"] += 1.5
+    clock["now"] += 1.6
+    s._last_video_pkt_t = clock["now"] - 0.1
     s._check_resize_restart()
     assert s.offers == []
+
+
+def test_video_that_stopped_just_after_the_request_still_offers(clock):
+    s = _session(clock)
+    s._last_video_pkt_t = clock["now"] + 0.15     # the Mac's last packets
+    clock["now"] += 1.6
+    s._check_resize_restart()
+    assert len(s.offers) == 1
 
 
 def test_a_re_offer_from_the_layout_path_is_enough(clock):

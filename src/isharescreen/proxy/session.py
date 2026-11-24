@@ -1029,7 +1029,7 @@ class Session:
         changes the canvas re-offers from the 0x451 handler, and a 0x3f2 from
         _on_media_stream_reinit, but a resize can bring neither (seen in a
         separate session: the Mac logged "stop video sending" and sent
-        nothing more). If no video arrived within _RESIZE_RESTART_S of a
+        nothing more). If video isn't flowing _RESIZE_RESTART_S after a
         resize request and nothing re-offered since, offer once."""
         sent = self.__dict__.get("_resize_sent_t", 0.0)
         if not sent or not self._connected:
@@ -1038,7 +1038,9 @@ class Session:
         if now - sent < _RESIZE_RESTART_S:
             return
         self._resize_sent_t = 0.0
-        if (self._last_video_pkt_t > sent
+        # Video *now*, not just since the request: the Mac keeps sending for
+        # ~150 ms after a 0x1d before it stops its streams.
+        if (now - self._last_video_pkt_t < 0.5
                 or getattr(self, "_last_reoffer_t", 0.0) > sent):
             return
         log.info("no video %.1f s after a resize request; offering the media "
