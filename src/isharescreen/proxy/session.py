@@ -105,6 +105,7 @@ def _is_rtcp(pkt: bytes) -> bool:
 # viewer: 16 x its 3 s RTCP timeout).
 _MEDIA_SILENCE_WARN_S = 10.0
 _MEDIA_SILENCE_END_S = 48.0
+_MEDIA_SILENCE_REOFFER_S = 20.0    # HPG fork: re-offer instead of ending
 
 
 _RTCP_SR_EVERY_N_TICKS = 10              # 10 × 0.5 s = 5 s SR cadence
@@ -4701,9 +4702,14 @@ class Session:
         sender reports (about once a second on each leg), so the stall logic
         rightly stays quiet. A stream that stopped silently sends neither and
         used to leave the viewer on its last frame forever. With no video and
-        no host RTCP for _MEDIA_SILENCE_WARN_S, warn; after
-        _MEDIA_SILENCE_END_S (Apple's viewer ends the session after 16 of its
-        3 s RTCP timeouts, 48 s), end the session so the frontend reports it.
+        no host RTCP for _MEDIA_SILENCE_WARN_S, warn.
+
+        HPG fork: then offer the media session again (0x1c, as for 0x3f2)
+        every _MEDIA_SILENCE_REOFFER_S instead of ending the session as Apple's
+        viewer does after 48 s. A Mac whose stream stopped restarts it; a
+        network outage is unaffected, and the picture returns as soon as
+        packets do (ending the session made it wait for a full reconnect).
+        ISS_MEDIA_DEAD=end restores ending after _MEDIA_SILENCE_END_S.
 
         Only armed once host RTCP has been seen in this session: a host that
         never sends reports keeps the old behaviour."""
@@ -4716,16 +4722,28 @@ class Session:
                 log.info("media stream alive again")
                 self._media_silence_warned = False
             return
+        end = os.environ.get("ISS_MEDIA_DEAD") == "end"
         if not self._media_silence_warned:
             self._media_silence_warned = True
             log.warning("media stream silent for %.0f s: no video and no host "
-                        "RTCP (a still screen keeps its reports coming); the "
-                        "session ends after %.0f s", silent, _MEDIA_SILENCE_END_S)
-        if silent >= _MEDIA_SILENCE_END_S:
-            log.error("media stream dead for %.0f s (no video, no host RTCP); "
-                      "ending the session, as Apple's viewer does", silent)
-            self._connected = False
-            self._fresh_evt.set()
+                        "RTCP (a still screen keeps its reports coming); %s",
+                        silent, f"the session ends after {_MEDIA_SILENCE_END_S:.0f} s"
+                        if end else "offering the media session again shortly")
+        if end:
+            if silent >= _MEDIA_SILENCE_END_S:
+                log.error("media stream dead for %.0f s (no video, no host "
+                          "RTCP); ending the session, as Apple's viewer does",
+                          silent)
+                self._connected = False
+                self._fresh_evt.set()
+            return
+        if (silent >= _MEDIA_SILENCE_REOFFER_S
+                and now - getattr(self, "_last_reoffer_t", 0.0) >= _MEDIA_SILENCE_REOFFER_S):
+            log.warning("media stream silent for %.0f s; offering the media "
+                        "session again", silent)
+            self._last_ctrl_event = ("media silent: re-offer", now)
+            self._send_cursor_rearm()
+            self._schedule_post_layout_arm()
 
     def _check_stall(self) -> None:
         """Decoder-stall recovery. Two failure modes:
