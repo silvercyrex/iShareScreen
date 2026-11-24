@@ -259,8 +259,11 @@ _KS_SHIFT_L = 0xffe1
 _KS_SHIFT_R = 0xffe2
 _KS_CONTROL_L = 0xffe3
 _KS_CONTROL_R = 0xffe4
-_KS_ALT_L = 0xffe9
-_KS_ALT_R = 0xffea
+# HPG fork: Alt is the Mac's Option key: Meta_L/R, which screensharingd
+# reads as Option (Alt_L/R, 0xffe9/0xffea, it reads as Command; the Win
+# key stays Command).
+_KS_ALT_L = 0xffe7
+_KS_ALT_R = 0xffe8
 _KS_SUPER_L = 0xffeb
 _KS_SUPER_R = 0xffec
 

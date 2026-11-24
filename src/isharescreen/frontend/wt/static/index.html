@@ -1297,8 +1297,16 @@ async function main() {
     latch.realKeyDown(ks);
   }
   // Leaving the window mid-shortcut must not leave Cmd held on the Mac.
+  // HPG fork: nor any modifier still down (Alt+Tab away leaves Alt, now the
+  // Mac's Option, down: the page never sees its keyup).
+  const modsDown = new Set();
   window.addEventListener("blur", () => {
     pendingPasteKs = 0;
+    for (const ks of modsDown) {
+      send({type: "key", down: false, keysym: ks});
+      latch.realKeyUp(ks);
+    }
+    modsDown.clear();
     if (!asCmd.size) return;
     for (const ks of asCmd.values()) send({type: "key", down: false, keysym: ks});
     asCmd.clear();
@@ -1340,6 +1348,7 @@ async function main() {
     }
     e.preventDefault();
     const ks = keysymFromEvent(e);
+    if (ks && ks >= 0xffe1 && ks <= 0xffee) modsDown.add(ks);
     if (ks) letterDown(ks, isCmdShortcut(e), e.code);
   });
   document.addEventListener("keyup", (e) => {
@@ -1359,6 +1368,7 @@ async function main() {
     }
     const ks = keysymFromEvent(e);
     if (ks) {
+      modsDown.delete(ks);
       send({type: "key", down: false, keysym: ks});
       latch.realKeyUp(ks);
     }
@@ -1888,6 +1898,7 @@ function makeKeyLatch(sendKey, onChange) {
 }
 // KEYLATCH-END
 
+const IS_MAC_VIEWER = /Mac|iPhone|iPad/i.test(navigator.platform);
 function keysymFromEvent(e) {
   const k = e.key;
   if (k.length === 1) return k.charCodeAt(0);
@@ -1902,6 +1913,11 @@ function keysymFromEvent(e) {
     Shift: 0xffe1, Control: 0xffe3, Alt: 0xffe9, Meta: 0xffeb,
     CapsLock: 0xffe5,
   };
+  // HPG fork: on Windows/Linux, Alt is the Mac's Option key (Meta_L/R,
+  // which screensharingd reads as Option; Alt_L/R it reads as Command). The
+  // Windows key and the Ctrl shortcuts stay Command. AltGr ("AltGraph")
+  // is not a modifier here: its characters arrive as typed.
+  if (k === "Alt" && !IS_MAC_VIEWER) return e.code === "AltRight" ? 0xffe8 : 0xffe7;
   return M[k] || 0;
 }
 

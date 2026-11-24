@@ -15,6 +15,8 @@ Key events are split between two callbacks:
 """
 from __future__ import annotations
 
+import sys
+
 import glfw
 
 from ...proxy.protocol.rfb import BTN_LEFT, BTN_MIDDLE, BTN_RIGHT
@@ -42,8 +44,11 @@ GLFW_KEY_TO_X11: dict[int, int] = {
     glfw.KEY_RIGHT_SHIFT:   0xffe2,
     glfw.KEY_LEFT_CONTROL:  0xffe3,
     glfw.KEY_RIGHT_CONTROL: 0xffe4,
-    glfw.KEY_LEFT_ALT:      0xffe9,
-    glfw.KEY_RIGHT_ALT:     0xffea,
+    # HPG fork: on Windows/Linux, Alt is the Mac's Option key (Meta_L/R,
+    # which screensharingd reads as Option; Alt_L/R it reads as Command).
+    # On a Mac viewer the key labelled Option keeps the old mapping.
+    glfw.KEY_LEFT_ALT:      0xffe9 if sys.platform == "darwin" else 0xffe7,
+    glfw.KEY_RIGHT_ALT:     0xffea if sys.platform == "darwin" else 0xffe8,
     glfw.KEY_LEFT_SUPER:    0xffeb,
     glfw.KEY_RIGHT_SUPER:   0xffec,
     glfw.KEY_CAPS_LOCK:     0xffe5,
