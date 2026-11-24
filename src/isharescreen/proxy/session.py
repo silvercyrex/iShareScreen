@@ -106,6 +106,7 @@ def _is_rtcp(pkt: bytes) -> bool:
 _MEDIA_SILENCE_WARN_S = 10.0
 _MEDIA_SILENCE_END_S = 48.0
 _MEDIA_SILENCE_REOFFER_S = 20.0    # HPG fork: re-offer instead of ending
+_RESIZE_RESTART_S = 1.5           # HPG fork: see Session._check_resize_restart
 
 
 _RTCP_SR_EVERY_N_TICKS = 10              # 10 × 0.5 s = 5 s SR cadence
@@ -1019,6 +1020,32 @@ class Session:
         except OSError:
             pass
         self.request_fir()
+        # HPG fork: see _check_resize_restart.
+        self._resize_sent_t = time.monotonic()
+
+    def _check_resize_restart(self) -> None:
+        """HPG fork: every display change stops the Mac's video and audio
+        until the viewer offers the media session again. A resize that
+        changes the canvas re-offers from the 0x451 handler, and a 0x3f2 from
+        _on_media_stream_reinit, but a resize can bring neither (seen in a
+        separate session: the Mac logged "stop video sending" and sent
+        nothing more). If no video arrived within _RESIZE_RESTART_S of a
+        resize request and nothing re-offered since, offer once."""
+        sent = self.__dict__.get("_resize_sent_t", 0.0)
+        if not sent or not self._connected:
+            return
+        now = time.monotonic()
+        if now - sent < _RESIZE_RESTART_S:
+            return
+        self._resize_sent_t = 0.0
+        if (self._last_video_pkt_t > sent
+                or getattr(self, "_last_reoffer_t", 0.0) > sent):
+            return
+        log.info("no video %.1f s after a resize request; offering the media "
+                 "session again", now - sent)
+        self._last_ctrl_event = ("resize: re-offer", now)
+        self._send_cursor_rearm()
+        self._schedule_post_layout_arm()
 
     # ── public state inspection ──────────────────────────────────────
 
@@ -4091,6 +4118,7 @@ class Session:
                 self._check_stall()
                 self._report_video_stall()
                 self._check_media_liveness()
+                self._check_resize_restart()
                 self._maybe_poll_cursor()
                 if self._tx_tick % _TX_PROFILE_EVERY_N_TICKS == 0:
                     self._log_profile_snapshot()
