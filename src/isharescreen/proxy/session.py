@@ -3228,6 +3228,12 @@ class Session:
         # mid-session tile-count change rather than the connect-time value.
         self._observed_tile_count = len(new_map)
         self._last_ssrc_adopt_ts = now
+        # HPG fork: arrival times are keyed by RTP timestamp alone; entries
+        # left by the abandoned group would be matched to the new group's
+        # frames and show up as minutes-long "receive->forward" times.
+        rx_t = self.__dict__.get("_frame_rx_t")
+        if rx_t:
+            rx_t.clear()
         # Grace window: pretend frames just flowed so the frame-flow gate
         # gives the new mapping ~0.5 s to start producing before we
         # consider another adoption.
