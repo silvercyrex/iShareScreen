@@ -1,6 +1,8 @@
 """The Mac never retransmits, so iss sends no NACK by default and waits for a
 missing H.264 packet only as long as a reorder takes; ISS_NACK=1 restores both."""
-import importlib
+import os
+import subprocess
+import sys
 import types
 from collections import defaultdict
 
@@ -20,11 +22,18 @@ def test_drain_sends_nothing_and_clears_when_off():
     assert not s._nack_pending
 
 
-def test_env_restores_nack_and_long_wait(monkeypatch):
-    monkeypatch.setenv("ISS_NACK", "1")
-    try:
-        m = importlib.reload(sess)
-        assert m._NACK_ENABLED is True and m._AVC_RTP_REPAIR_WAIT_S == 0.075
-    finally:
-        monkeypatch.delenv("ISS_NACK")
-        importlib.reload(sess)
+def test_env_restores_nack_and_long_wait():
+    # In a fresh interpreter: reloading the module here would swap the
+    # classes other tests already imported.
+    code = ("from isharescreen.proxy import session as s; "
+            "print(s._NACK_ENABLED, s._AVC_RTP_REPAIR_WAIT_S)")
+    env = dict(os.environ, ISS_NACK="1")
+    env.pop("ISS_AVC_REPAIR_WAIT_MS", None)
+    out = subprocess.run([sys.executable, "-c", code], env=env,
+                         capture_output=True, text=True, check=True).stdout.split()
+    assert out == ["True", "0.075"]
+    env = dict(os.environ, ISS_AVC_REPAIR_WAIT_MS="30")
+    env.pop("ISS_NACK", None)
+    out = subprocess.run([sys.executable, "-c", code], env=env,
+                         capture_output=True, text=True, check=True).stdout.split()
+    assert out == ["False", "0.03"]
