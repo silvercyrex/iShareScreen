@@ -193,14 +193,54 @@ helping a person in their own session, and IT working in a separate session.
   upstream): Apple's RCTL receiver rate feedback. With `ISS_RCTL=1` the
   bridge caps it at 80% of the slowest viewer's connection rate. Off by
   default: in the lab (macOS 27, H.264) the Mac ignored it, sending 43-63
-  Mbit/s while asked for 4-5.
+  Mbit/s while asked for 4-5. Use `--max-bitrate` instead (below), which
+  the Mac does follow.
+
+**Fixes from other forks and the lab (2026-11-24)**
+- Taken from other forks of the project, each tested against the test Mac
+  (macOS 27, H.264) before and after: madmalkav (record split, RTCP on the
+  right media leg, no NACKs, dead-stream check, `--max-bitrate`, stale-tile
+  guard, 800x600 minimum, 1x1 resize request), jiong-han (cheaper packet
+  grouping), alakangas (desktop upload flush), Chapoly1305 (Windows keyboard
+  hook return type).
+- `--max-bitrate N` (Mbit/s) caps the Mac's video through the offer's
+  bitrate tiers, which the Mac follows (16 -> 8.5 -> 4.2 Mbit/s measured at
+  no cap / 8 / 4). On a lossy path it helps a lot: with 2% loss, complete
+  frames delivered went from 14 to 34 a second at 8 Mbit/s. Off by default;
+  a launcher should set it for viewers outside the office.
+- The Mac never resends lost packets, so iss no longer asks (NACK) or waits
+  75 ms for them: with 1% loss the worst receive-to-forward delay fell from
+  about 100 ms to 4 ms, with no extra frames lost.
+- A media stream with no video and no Mac reports for 20 s is offered again
+  (every 20 s) instead of being left frozen. Ending the session instead, as
+  Apple's viewer does, made recovery after a network outage take a full
+  reconnect (about 14 s instead of 1 s), so it is off (`ISS_MEDIA_DEAD=end`).
+- A browser resize in a separate session stopped the picture for good: the
+  Mac stops its streams on every display change and waits for a new offer,
+  and sent nothing that triggered one. iss now offers again if video isn't
+  flowing 1.5 s after a resize request (lab: 15 of 16 resizes back within
+  about 1.5 s).
+- The viewer page froze when a slow decoder skipped ahead to a keyframe
+  and the keyframe came while it was still behind: it then waited forever
+  with data arriving. It now repeats the request once a second while it
+  waits (lab: froze 2 of 2 runs before, 0 of 2 after).
+- Checked and left out: a second wake trigger (vjanelle; our Mac already
+  sends the one we use), punctuation shortcuts on the GLFW path
+  (walkerfirmin; the Windows keyboard grab already covers them), an input
+  writer thread (Chapoly1305; small gain for a change to all input), a
+  single video stream request (benekuehn; no second stream seen), a quiet-
+  screen watchdog change (benekuehn; no false keyframe requests on a still
+  screen here), and allowRTCPFB for H.264 (benekuehn; the Mac still has
+  retransmission off).
 
 **Settings (environment)**
 - `ISS_UDP_RCVBUF` (bytes, default 8 MB), `ISS_WT_MAX_BEHIND_MS` (500),
   `ISS_WT_RESUME_BEHIND_MS` (150), `ISS_WT_KEYFRAME_RETRY_MS` (1500),
   `ISS_WT_CONGESTION` (`reno`; `cubic` was worse in the lab),
   `ISS_RCTL` (off), `ISS_WT_RCTL_SHARE` (0.8), `ISS_WT_RCTL_MIN_KBPS` (800),
-  `ISS_GIL_SWITCH_MS` (0.5), `ISS_BROWSER_NO_REORDER` (on).
+  `ISS_GIL_SWITCH_MS` (0.5), `ISS_BROWSER_NO_REORDER` (on),
+  `ISS_NACK` (off), `ISS_AVC_REPAIR_WAIT_MS` (10), `ISS_MEDIA_DEAD`
+  (`reoffer`; `end` ends the session after 48 s).
 
 **Other**
 - `requirements.lock`: the exact, hashed set of dependencies tested together.
@@ -218,9 +258,10 @@ date. `src/isharescreen/frontend/wt/hpg.py` is new.
   plus a second process holding the ports (only one test Mac exists).
 - An animated lock screen (macOS aerial wallpaper) makes the Mac send about
   44 Mbit/s at 1080p, which the bridge can't fully receive (about half is
-  dropped in the lab) and no outside connection could carry; nothing the
-  viewer can request lowers it (rate feedback, a smaller screen). Use a still
-  lock screen picture on managed Macs.
+  dropped in the lab) and no outside connection could carry. Rate feedback
+  and a smaller screen don't lower it; `--max-bitrate` should (it caps the
+  encoder; not yet tried on the lock screen itself). A still lock screen
+  picture on managed Macs avoids it.
 - The viewer's status bar shows "frozen" whenever the Mac's screen is still
   (upstream behaviour): a still screen is not a fault.
 
