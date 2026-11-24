@@ -258,6 +258,8 @@ helping a person in their own session, and IT working in a separate session.
   cannot tell which). The page now says "the Mac closed the connection" and
   offers Reconnect (same login) to the controlling viewer, instead of
   showing the last picture; nobody reconnecting for 10 minutes ends it.
+  A session that comes back any other way (a new viewer link, a resolution
+  change) ends that wait too, and every viewer's notice clears.
 - While nothing is forwarded for over 10 s, the log says where video stops
   ("video stall …": UDP packets in, decrypt ok/failed, drops by reason).
 
