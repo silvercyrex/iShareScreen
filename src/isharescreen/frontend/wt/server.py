@@ -224,6 +224,9 @@ _FORCE_KEYFRAME_ON_JOIN = True
 _AUTH_TIMEOUT_S = 5.0          # a viewer must send its ticket within this
 _MAX_PENDING = 8               # unauthenticated WebTransport sessions at once
 _MAX_SESSION_ATTEMPTS = 3      # Mac session start tries (never on bad login)
+_CLIPBOARD_MAX_CHARS = 256 * 1024   # HPG fork: clipboard text either way
+_INPUT_BUFFER_MAX = 8 * 1024 * 1024  # HPG fork: one viewer's unfinished input line
+_MAC_LOST_WAIT_S = 600.0            # HPG fork: wait this long for "reconnect"
 
 
 class _ViewerSession:
@@ -554,6 +557,12 @@ class _ViewerSession:
             if self.close_cb is not None:
                 self.close_cb()
             return
+        if len(self.input_buffer) > _INPUT_BUFFER_MAX:
+            # HPG fork: room for one clipboard line, not for an endless one.
+            log.warning("viewer %d sent an input line over %d bytes; dropped",
+                        self.session_id, _INPUT_BUFFER_MAX)
+            self.input_buffer.clear()
+            return
         while True:
             nl = self.input_buffer.find(b"\n")
             if nl < 0:
@@ -565,7 +574,8 @@ class _ViewerSession:
             try:
                 msg = json.loads(line)
             except Exception as e:
-                log.warning("bad input json: %s — %s", e, line[:80])
+                # HPG fork: length only; a line can carry clipboard text.
+                log.warning("bad input json (%d bytes): %s", len(line), e)
                 continue
             if not isinstance(msg, dict):
                 continue
@@ -802,10 +812,15 @@ class WebTransportBridge:
         password_from_page: bool = False,
         mac_name: str = "",
         exit_on_stdin_close: bool = False,
+        clipboard: bool = False,
     ) -> None:
         # HPG fork: this frontend forwards the Mac's H.264 to the browsers and
         # never uses iss's own decode, so the session skips decoding the burst.
-        self._config = dataclasses.replace(config, video_passthrough=True)
+        # HPG fork: --clipboard text swaps clipboard text between the Mac and
+        # the controlling viewer's browser (never for view-only).
+        self._clipboard = bool(clipboard) and not view_only
+        self._config = dataclasses.replace(config, video_passthrough=True,
+                                           clipboard_sync=self._clipboard)
         self._port = port
         # HPG fork: listen only where told (upstream: every interface).
         self._bind = bind
@@ -1007,10 +1022,12 @@ class WebTransportBridge:
                 with self._viewers_lock:
                     targets = list(self.viewers)
                 # HPG fork: the Mac dropped the connection under us (a
-                # Remote Management settings change does that); connect again
-                # instead of showing the last picture forever.
+                # Remote Management settings change does that, and so does
+                # the person at the Mac ending the sharing); say so instead of
+                # showing the last picture forever.
                 if (sess is not None and not sess.is_connected and targets
-                        and not getattr(self, "_reconnect_pending", False)):
+                        and not getattr(self, "_reconnect_pending", False)
+                        and not getattr(self, "_mac_lost", False)):
                     self._on_mac_connection_lost()
                 # HPG fork: tell the Mac what the slowest viewer can take.
                 self._update_rctl_cap(targets)
@@ -1220,7 +1237,8 @@ class WebTransportBridge:
         if self._owner is None and not adm.is_joiner:
             self._owner = viewer
         viewer.send_control({"type": "auth_ok", "read_only": ro,
-                             "source_url": self.source_url})
+                             "source_url": self.source_url,
+                             "clipboard": self._clipboard and not ro})
         self._events.emit("viewer_joined", user=adm.user, sid=adm.sid,
                           read_only=ro, viewers=len(self.viewers) + 1)
         self._events.user_connected(adm.user)
@@ -1475,6 +1493,8 @@ class WebTransportBridge:
             # cursor is NOT baked into the framebuffer, so moving the mouse
             # doesn't dirty the frame / wake the encoder.
             session.set_cursor_callback(self._on_cursor)
+            if self._clipboard:
+                session.set_clipboard_text_callback(self._on_mac_clipboard)
             # Audio: opus encoder + callback hook. Audio runs on its
             # own thread (the session's audio RX thread). Each Opus
             # packet is sent as a WebTransport DATAGRAM (RFC 9297) —
@@ -1769,6 +1789,10 @@ class WebTransportBridge:
                 self._session.set_cursor_callback(None)
             except Exception:
                 pass
+            try:
+                self._session.set_clipboard_text_callback(None)
+            except Exception:
+                pass
         if self._audio_enc is not None:
             self._audio_enc.close()
             self._audio_enc = None
@@ -2021,6 +2045,9 @@ class WebTransportBridge:
             # collapse into a single restart cycle.
             self._restart_session("wt-session-resreconnect")
             return
+        if kind == "reconnect":
+            self._reconnect_after_mac_lost()
+            return
         if self._session is None:
             return
         try:
@@ -2040,8 +2067,57 @@ class WebTransportBridge:
                 )
             elif kind == "resize":
                 self._handle_resize(int(msg["w"]), int(msg["h"]))
+            elif kind == "clipboard":
+                self._clipboard_to_mac(msg.get("text"))
         except Exception as e:
             log.debug("input dispatch error: %s", e)
+
+    # HPG fork: clipboard text between the Mac and the controlling viewer.
+    # Lengths are logged, never the text.
+    def _clipboard_to_mac(self, text) -> None:
+        if not self._clipboard or self._session is None:
+            return
+        if not isinstance(text, str) or not text:
+            return
+        if len(text) > _CLIPBOARD_MAX_CHARS:
+            log.info("clipboard to Mac: %d chars, over the %d limit; not sent",
+                     len(text), _CLIPBOARD_MAX_CHARS)
+            return
+        self._clip_to_mac = text
+        self._session.input.cut_text(text)
+        log.info("clipboard to Mac: %d chars", len(text))
+
+    def _on_mac_clipboard(self, text: str) -> None:
+        """Session TCP thread: text was copied on the Mac."""
+        if not text or text == getattr(self, "_clip_to_mac", None):
+            return   # empty, or our own paste coming back from the Mac
+        if len(text) > _CLIPBOARD_MAX_CHARS:
+            log.info("clipboard from Mac: %d chars, over the %d limit; not sent",
+                     len(text), _CLIPBOARD_MAX_CHARS)
+            return
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(self._queue_clipboard_to_viewer, text)
+
+    def _queue_clipboard_to_viewer(self, text: str) -> None:
+        # Coalesce: a Mac rewriting its clipboard in a loop sends the viewer
+        # only the newest text, a few times a second at most.
+        self._clip_to_viewer = text
+        if getattr(self, "_clip_handle", None) is None:
+            self._clip_handle = self._loop.call_later(0.3, self._flush_clipboard_to_viewer)
+
+    def _flush_clipboard_to_viewer(self) -> None:
+        self._clip_handle = None
+        text, self._clip_to_viewer = getattr(self, "_clip_to_viewer", None), None
+        if text:
+            self._clipboard_to_viewer(text)
+
+    def _clipboard_to_viewer(self, text: str) -> None:
+        v = self._controller
+        if v is None or v not in self.viewers or v.read_only:
+            return
+        v.send_control({"type": "clipboard", "text": text})
+        log.info("clipboard from Mac: %d chars to viewer %d", len(text), v.session_id)
 
     def _restart_session(self, thread_name: str) -> None:
         """Tear the Mac session down and start a fresh one for the viewers
@@ -2071,19 +2147,36 @@ class WebTransportBridge:
         threading.Thread(target=_do_reconnect, name=thread_name, daemon=True).start()
 
     def _on_mac_connection_lost(self) -> None:
-        """HPG fork: the Mac closed the RFB connection while viewers watch
-        (screensharingd drops its viewers when the Screen Sharing / Remote
-        Management settings change). Connect again with the same login; a Mac
-        that closes it more than 3 times in 2 minutes ends the bridge instead."""
-        now = time.monotonic()
-        lost = [t for t in getattr(self, "_mac_lost_t", []) if now - t < 120.0]
-        lost.append(now)
-        self._mac_lost_t = lost
-        if len(lost) > 3:
-            log.error("the Mac keeps closing the screen sharing connection; ending")
+        """HPG fork: the Mac closed the RFB connection while viewers watch.
+        That happens when the Screen Sharing / Remote Management settings
+        change, but also when the person at the Mac ends the sharing, and the
+        bridge cannot tell which, so it does not log in again by itself: the
+        viewers are told, and the controlling viewer can reconnect with one
+        click (the same login). Nobody reconnecting for 10 minutes ends it."""
+        self._mac_lost = True
+        log.warning("the Mac closed the screen sharing connection; waiting for "
+                    "the viewer to reconnect")
+        threading.Thread(target=self._teardown_session,
+                         name="wt-session-lost", daemon=True).start()
+        for v in list(self.viewers):
+            v.send_control({"type": "mac_lost"})
+        loop = self._loop
+        if loop is not None:
+            self._mac_lost_handle = loop.call_later(_MAC_LOST_WAIT_S, self._mac_lost_expired)
+
+    def _mac_lost_expired(self) -> None:
+        if getattr(self, "_mac_lost", False):
             self.stop("the Mac closed the screen sharing connection", exit_code=1)
+
+    def _reconnect_after_mac_lost(self) -> None:
+        if not getattr(self, "_mac_lost", False):
             return
-        log.warning("the Mac closed the screen sharing connection; connecting again")
+        self._mac_lost = False
+        handle = getattr(self, "_mac_lost_handle", None)
+        if handle is not None:
+            handle.cancel()
+            self._mac_lost_handle = None
+        log.info("viewer asked to reconnect to the Mac")
         self._restart_session("wt-session-macreconnect")
 
     def _display_scale(self) -> float:
