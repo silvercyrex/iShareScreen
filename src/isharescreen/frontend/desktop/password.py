@@ -9,6 +9,7 @@ Only a connected session comes back; the video window opens after that.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import threading
 from typing import Callable, Optional
@@ -38,6 +39,17 @@ def connect_with_prompt(
     """Ask for the password and run `connect(password)` (which returns a
     connected session or raises). Returns (session or None, exit code, reason).
     Without a usable GUI toolkit it returns (None, 1, reason)."""
+    result = _prompt(user, name, connect, max_tries)
+    # The window's callbacks refer to themselves and to the Tk root, so the
+    # Tk objects are only freed by the garbage collector, and Tcl aborts the
+    # process if that happens on another thread ("Tcl_AsyncDelete: async
+    # handler deleted by the wrong thread", seen on Windows once the session's
+    # threads ran). Collect them here, on the thread that created them.
+    gc.collect()
+    return result
+
+
+def _prompt(user, name, connect, max_tries):
     try:
         import tkinter as tk
     except ImportError:
