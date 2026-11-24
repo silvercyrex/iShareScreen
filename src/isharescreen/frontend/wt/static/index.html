@@ -970,6 +970,12 @@ async function main() {
           macLost = true;
           setStatus("the Mac closed the screen sharing connection", "err");
           reconnectBtn.style.display = readOnly ? "none" : "";
+        } else if (m.type === "mac_back") {
+          // A new Mac session is up (someone reconnected, or it was started
+          // another way): every viewer drops the notice and the button.
+          macLost = false;
+          reconnectBtn.style.display = "none";
+          setStatus("connected to the Mac again", "ok");
         } else if (m.type === "clipboard" && clipOn && typeof m.text === "string") {
           macClipText = m.text;
           copyMacClip();

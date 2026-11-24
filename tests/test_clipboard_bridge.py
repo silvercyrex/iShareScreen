@@ -138,3 +138,21 @@ def test_session_hands_mac_text_to_the_page_not_the_gateway_clipboard(monkeypatc
     monkeypatch.setenv("ISS_CLIP", "1")
     s._handle_clipboard_send(build_clipboard_send("again"))
     assert pushed == ["again"]
+
+
+def test_a_later_mac_copy_of_text_we_pasted_still_arrives():
+    b = _bridge()
+    b._clipboard_to_mac("A")
+    b._on_mac_clipboard("A")                      # our echo: skipped
+    b._on_mac_clipboard("B")
+    b._on_mac_clipboard("A")                      # a real copy on the Mac
+    assert b._controller.controls == [{"type": "clipboard", "text": "B"},
+                                      {"type": "clipboard", "text": "A"}]
+
+
+def test_other_mac_text_ends_the_echo_wait():
+    b = _bridge()
+    b._clipboard_to_mac("A")
+    b._on_mac_clipboard("B")                      # the echo never came
+    b._on_mac_clipboard("A")
+    assert [c["text"] for c in b._controller.controls] == ["B", "A"]

@@ -75,3 +75,26 @@ def test_reconnect_without_a_lost_connection_is_ignored(monkeypatch):
     b, calls = _bridge(monkeypatch)
     b._reconnect_after_mac_lost()
     assert calls == []
+
+
+def test_a_session_started_another_way_ends_the_wait_for_everyone(monkeypatch):
+    b, calls = _bridge(monkeypatch)
+    b.viewers = [_Viewer(), _Viewer()]
+    b._on_mac_connection_lost()
+    handle = b._loop.later[0][1]
+    b._mac_back()                                 # e.g. a page reload logged in
+    assert not b._mac_lost and handle.cancelled
+    assert all({"type": "mac_back"} in v.controls for v in b.viewers)
+    handle.fn()                                   # the old expiry can't stop it
+    assert ("stop", 1) not in calls
+
+
+def test_after_a_reconnect_click_the_other_viewers_are_told_too(monkeypatch):
+    b, calls = _bridge(monkeypatch)
+    b.viewers = [_Viewer(), _Viewer()]
+    b._on_mac_connection_lost()
+    b._reconnect_after_mac_lost()
+    assert b._mac_lost_reconnecting
+    b._mac_back()
+    assert all({"type": "mac_back"} in v.controls for v in b.viewers)
+    assert not b._mac_lost_reconnecting

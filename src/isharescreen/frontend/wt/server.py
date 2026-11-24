@@ -1522,6 +1522,13 @@ class WebTransportBridge:
                 self._gate_thread.start()
             self._session_attempts = 0
             self._mac_connected_t = time.monotonic()
+            # HPG fork: a session that came up any way (the Reconnect click, a
+            # page reload, another viewer joining, a resolution change) ends
+            # the "Mac closed the connection" wait for everyone.
+            if ((getattr(self, "_mac_lost", False)
+                    or getattr(self, "_mac_lost_reconnecting", False))
+                    and self._loop is not None):
+                self._loop.call_soon_threadsafe(self._mac_back)
             self._events.emit("mac_connected", host=self._config.host,
                               user=self._config.username,
                               udp_rcvbuf=getattr(session, "udp_rcvbuf", 0))
@@ -2089,8 +2096,14 @@ class WebTransportBridge:
 
     def _on_mac_clipboard(self, text: str) -> None:
         """Session TCP thread: text was copied on the Mac."""
-        if not text or text == getattr(self, "_clip_to_mac", None):
-            return   # empty, or our own paste coming back from the Mac
+        if not text:
+            return
+        # Our own paste coming back from the Mac is skipped once; any other
+        # text ends that, so a later real copy of the same text still arrives.
+        echo = text == getattr(self, "_clip_to_mac", None)
+        self._clip_to_mac = None
+        if echo:
+            return
         if len(text) > _CLIPBOARD_MAX_CHARS:
             log.info("clipboard from Mac: %d chars, over the %d limit; not sent",
                      len(text), _CLIPBOARD_MAX_CHARS)
@@ -2168,15 +2181,33 @@ class WebTransportBridge:
         if getattr(self, "_mac_lost", False):
             self.stop("the Mac closed the screen sharing connection", exit_code=1)
 
-    def _reconnect_after_mac_lost(self) -> None:
+    def _clear_mac_lost(self) -> bool:
+        """End the wait after a lost Mac connection (and its 10-minute
+        expiry). True if there was one."""
         if not getattr(self, "_mac_lost", False):
-            return
+            return False
         self._mac_lost = False
         handle = getattr(self, "_mac_lost_handle", None)
         if handle is not None:
             handle.cancel()
             self._mac_lost_handle = None
+        return True
+
+    def _mac_back(self) -> None:
+        """On the loop: a new Mac session is up while the bridge was waiting
+        after a lost connection; every viewer's page drops its notice."""
+        self._mac_lost_reconnecting = False
+        if self._clear_mac_lost():
+            log.info("Mac session is back; the reconnect wait is over")
+        for v in list(self.viewers):
+            v.send_control({"type": "mac_back"})
+
+    def _reconnect_after_mac_lost(self) -> None:
+        if not self._clear_mac_lost():
+            return
         log.info("viewer asked to reconnect to the Mac")
+        # The other viewers' pages are told by _mac_back once it is up.
+        self._mac_lost_reconnecting = True
         self._restart_session("wt-session-macreconnect")
 
     def _display_scale(self) -> float:
